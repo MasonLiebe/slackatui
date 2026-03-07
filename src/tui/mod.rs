@@ -42,6 +42,7 @@ pub struct App {
 
     // Search state
     pub search_input: String,
+    pub last_search_match: Option<usize>,
 
     // Status / mode indicator
     pub status: String,
@@ -65,6 +66,7 @@ impl App {
             input: String::new(),
             cursor_pos: 0,
             search_input: String::new(),
+            last_search_match: None,
             status: String::new(),
         }
     }
@@ -178,6 +180,49 @@ impl App {
                 .unwrap_or(0);
             self.cursor_pos += next;
         }
+    }
+
+    /// Search channels forward from current position for matching name.
+    pub fn channel_search_next(&mut self) -> Option<usize> {
+        if self.search_input.is_empty() || self.channels.is_empty() {
+            return None;
+        }
+        let query = self.search_input.to_lowercase();
+        let start = self.last_search_match.map(|i| i + 1).unwrap_or(0);
+
+        // Search forward from start, wrapping around
+        for offset in 0..self.channels.len() {
+            let idx = (start + offset) % self.channels.len();
+            if self.channels[idx].name.to_lowercase().contains(&query) {
+                self.last_search_match = Some(idx);
+                self.selected_channel = idx;
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Search channels backward from current position.
+    pub fn channel_search_prev(&mut self) -> Option<usize> {
+        if self.search_input.is_empty() || self.channels.is_empty() {
+            return None;
+        }
+        let query = self.search_input.to_lowercase();
+        let start = self
+            .last_search_match
+            .unwrap_or(0)
+            .checked_sub(1)
+            .unwrap_or(self.channels.len() - 1);
+
+        for offset in 0..self.channels.len() {
+            let idx = (start + self.channels.len() - offset) % self.channels.len();
+            if self.channels[idx].name.to_lowercase().contains(&query) {
+                self.last_search_match = Some(idx);
+                self.selected_channel = idx;
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Take the current input buffer, resetting it.
@@ -553,15 +598,33 @@ fn dispatch_action(
 
         // Search
         "clear-input" => {
+            if !app.search_input.is_empty() {
+                // On first enter/escape in search mode, jump to first match
+                if let Some(idx) = app.channel_search_next() {
+                    let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
+                }
+            }
             app.search_input.clear();
+            app.last_search_match = None;
             app.mode = Mode::Command;
             app.status.clear();
         }
-        "channel-search-next" | "channel-search-prev" => {
-            // Will be implemented when channel list is wired
+        "channel-search-next" => {
+            if let Some(idx) = app.channel_search_next() {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
+            }
+        }
+        "channel-search-prev" => {
+            if let Some(idx) = app.channel_search_prev() {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
+            }
         }
         "channel-jump" => {
-            // Will be implemented when channel list is wired
+            // Toggle thread visibility on the selected message
+            app.thread_visible = !app.thread_visible;
+            if !app.thread_visible {
+                app.thread_messages.clear();
+            }
         }
 
         // Quit
@@ -900,5 +963,88 @@ mod tests {
         handle_key_async(&mut app, KeyCode::Esc, KeyModifiers::NONE, &tx);
         assert_eq!(app.mode, Mode::Command);
         assert!(app.search_input.is_empty());
+    }
+
+    fn app_with_channels() -> App {
+        let mut app = test_app();
+        for name in ["general", "random", "dev", "design", "devops"] {
+            app.channels.push(ChannelItem::new(
+                format!("C-{}", name),
+                name.to_string(),
+                crate::types::ChannelType::Channel,
+            ));
+        }
+        app
+    }
+
+    #[test]
+    fn test_channel_search_next_found() {
+        let mut app = app_with_channels();
+        app.search_input = "dev".to_string();
+
+        let result = app.channel_search_next();
+        assert_eq!(result, Some(2)); // "dev" at index 2
+        assert_eq!(app.selected_channel, 2);
+    }
+
+    #[test]
+    fn test_channel_search_next_wraps() {
+        let mut app = app_with_channels();
+        // channels: general(0), random(1), dev(2), design(3), devops(4)
+        app.search_input = "dev".to_string();
+
+        // First match: "dev" at 2
+        app.channel_search_next();
+        assert_eq!(app.selected_channel, 2);
+
+        // Second match: "design" at 3 (contains "dev" substring? No, "design" does not contain "dev")
+        // Actually "design" does NOT contain "dev". Only dev(2) and devops(4) match.
+        // Second match: "devops" at 4
+        app.channel_search_next();
+        assert_eq!(app.selected_channel, 4);
+
+        // Wraps back to "dev" at 2
+        app.channel_search_next();
+        assert_eq!(app.selected_channel, 2);
+    }
+
+    #[test]
+    fn test_channel_search_not_found() {
+        let mut app = app_with_channels();
+        app.search_input = "xyz".to_string();
+
+        let result = app.channel_search_next();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_channel_search_empty_query() {
+        let mut app = app_with_channels();
+        app.search_input.clear();
+
+        let result = app.channel_search_next();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_channel_search_prev() {
+        let mut app = app_with_channels();
+        app.search_input = "dev".to_string();
+
+        // Set position after devops
+        app.last_search_match = Some(4);
+
+        let result = app.channel_search_prev();
+        // Should find "devops" at 4 (wrapping backward)
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_channel_search_case_insensitive() {
+        let mut app = app_with_channels();
+        app.search_input = "DEV".to_string();
+
+        let result = app.channel_search_next();
+        assert_eq!(result, Some(2));
     }
 }
