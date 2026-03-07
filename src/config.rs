@@ -201,6 +201,7 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     command.insert("h".into(), "focus-left".into());
     command.insert("<enter>".into(), "select".into());
     command.insert("'".into(), "open-thread".into());
+    command.insert("r".into(), "reply".into());
     command.insert("q".into(), "quit".into());
     command.insert("<f1>".into(), "help".into());
     key_map.insert("command".into(), command);
@@ -209,11 +210,17 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     insert.insert("<left>".into(), "cursor-left".into());
     insert.insert("<right>".into(), "cursor-right".into());
     insert.insert("<enter>".into(), "send".into());
+    insert.insert("<s-enter>".into(), "newline".into());
     insert.insert("<escape>".into(), "mode-command".into());
     insert.insert("<backspace>".into(), "backspace".into());
     insert.insert("C-8".into(), "backspace".into());
     insert.insert("<delete>".into(), "delete".into());
     insert.insert("<space>".into(), "space".into());
+    insert.insert("<tab>".into(), "indent".into());
+    insert.insert("<s-tab>".into(), "dedent".into());
+    insert.insert("C-b".into(), "toggle-bold".into());
+    insert.insert("C-i".into(), "toggle-italic".into());
+    insert.insert("C-u".into(), "toggle-underline".into());
     key_map.insert("insert".into(), insert);
 
     let mut search = KeyMapping::new();

@@ -2,7 +2,97 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 
 use super::App;
+use crate::parse;
 use crate::types::{Focus, Mode};
+
+const LOGO: &[&str] = &[
+    r"     _            _         _         _ ",
+    r"    | |          | |       | |       (_)",
+    r" ___| | __ _  ___| | ____ _| |_ _   _ _ ",
+    r"/ __| |/ _` |/ __| |/ / _` | __| | | | |",
+    r"\__ \ | (_| | (__|   < (_| | |_| |_| | |",
+    r"|___/_|\__,_|\___|_|\_\__,_|\__|\__,_|_|",
+];
+
+const WELCOME_MESSAGES: &[&str] = &[
+    "Your terminal just got chattier.",
+    "Slack, but make it retro.",
+    "Who needs a browser anyway?",
+    "Terminal-grade procrastination.",
+    "Now with 100% more monospace.",
+    "Because GUIs are overrated.",
+    "Alt+Tab? Never heard of her.",
+    "Slack from where you code.",
+];
+
+/// Render the splash screen. `frame_idx` controls the typewriter animation (0..=total chars).
+pub fn render_splash(frame: &mut Frame, frame_idx: usize) {
+    let area = frame.area();
+
+    // Pick a deterministic "random" welcome message based on current minute
+    let now = chrono::Local::now();
+    let msg_idx = (now.timestamp() / 60) as usize % WELCOME_MESSAGES.len();
+    let welcome = WELCOME_MESSAGES[msg_idx];
+
+    // Total chars in the logo for the typewriter effect
+    let total_logo_chars: usize = LOGO.iter().map(|l| l.len()).sum();
+
+    // Build logo lines with typewriter reveal
+    let mut chars_remaining = frame_idx;
+    let mut logo_lines: Vec<Line> = Vec::new();
+    for &logo_line in LOGO {
+        if chars_remaining == 0 {
+            break;
+        }
+        let visible = chars_remaining.min(logo_line.len());
+        chars_remaining = chars_remaining.saturating_sub(logo_line.len());
+        logo_lines.push(Line::from(Span::styled(
+            &logo_line[..visible],
+            Style::default().fg(Color::Rgb(100, 200, 140)).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // After logo is fully typed, show welcome message with a fade-in
+    let welcome_visible = frame_idx > total_logo_chars;
+    let subtitle_line = if welcome_visible {
+        let sub_chars = (frame_idx - total_logo_chars).min(welcome.len());
+        Line::from(Span::styled(
+            &welcome[..sub_chars],
+            Style::default().fg(Color::Rgb(180, 180, 220)),
+        ))
+    } else {
+        Line::default()
+    };
+
+    // Show "press any key" after everything is typed
+    let hint_visible = frame_idx > total_logo_chars + welcome.len();
+    let hint_line = if hint_visible {
+        Line::from(Span::styled(
+            "press any key to continue",
+            Style::default().fg(Color::Rgb(90, 90, 110)),
+        ))
+    } else {
+        Line::default()
+    };
+
+    // Center vertically: logo height + 2 blank + subtitle + 1 blank + hint
+    let content_height = logo_lines.len() + 4;
+    let top_pad = area.height.saturating_sub(content_height as u16) / 2;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for _ in 0..top_pad {
+        lines.push(Line::default());
+    }
+    lines.extend(logo_lines);
+    lines.push(Line::default());
+    lines.push(Line::default());
+    lines.push(subtitle_line);
+    lines.push(Line::default());
+    lines.push(hint_line);
+
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+}
 
 /// Border color for focused vs unfocused panes.
 fn border_color(app: &App, pane: Focus) -> Color {
@@ -13,8 +103,32 @@ fn border_color(app: &App, pane: Focus) -> Color {
     }
 }
 
+/// Convert message content into styled spans using mrkdwn parsing.
+fn content_spans(content: &str) -> Vec<Span<'_>> {
+    let segments = parse::parse_mrkdwn(content);
+    segments
+        .into_iter()
+        .map(|seg| {
+            let mut style = Style::default();
+            if seg.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if seg.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if seg.strikethrough {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            if seg.code {
+                style = style.fg(Color::Rgb(220, 170, 80)).bg(Color::Rgb(40, 40, 50));
+            }
+            Span::styled(seg.text, style)
+        })
+        .collect()
+}
+
 /// Render the entire application UI.
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
     // Vertical: main area + 1-line status bar
@@ -109,7 +223,7 @@ fn render_channels(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the chat/messages pane with embedded input box.
-fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
+fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let channel_name = app
         .current_channel()
         .map(|ch| ch.display_name().to_string())
@@ -131,7 +245,13 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     // Split inner: messages area + input box (when inserting)
-    let input_height = if app.mode == Mode::Insert { 3 } else { 0 };
+    // Height grows with newlines, min 3 (border + 1 line), max 10
+    let input_height = if app.mode == Mode::Insert {
+        let line_count = app.input.chars().filter(|&c| c == '\n').count() + 1;
+        (line_count as u16 + 2).min(10).max(3)
+    } else {
+        0
+    };
 
     let chat_split = Layout::default()
         .direction(Direction::Vertical)
@@ -147,162 +267,221 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Build display lines for a single message, splitting on newlines.
+/// First line gets timestamp + name, continuation lines get indented.
+fn build_message_lines<'a>(msg: &'a crate::types::Message, is_selected: bool) -> Vec<Line<'a>> {
+    let time_str = msg.time.format("%H:%M").to_string();
+    let header_width = time_str.len() + 2 + msg.name.len() + 2; // " HH:MM name: "
+    let indent: String = " ".repeat(header_width);
+
+    let reply_indicator = if msg.reply_count > 0 {
+        format!(" [{} replies]", msg.reply_count)
+    } else if !msg.thread.is_empty() {
+        " [thread]".to_string()
+    } else {
+        String::new()
+    };
+
+    let sel_bg = if is_selected {
+        Some(Color::Rgb(50, 50, 70))
+    } else {
+        None
+    };
+
+    // Helper to optionally add selection background
+    let style_with_bg = |s: Style| -> Style {
+        if let Some(bg) = sel_bg {
+            s.bg(bg)
+        } else {
+            s
+        }
+    };
+
+    let content_lines: Vec<&str> = msg.content.split('\n').collect();
+    let mut result = Vec::new();
+
+    for (line_idx, content_line) in content_lines.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+
+        if line_idx == 0 {
+            // First line: timestamp + name + content
+            spans.push(Span::styled(
+                format!(" {} ", time_str),
+                style_with_bg(Style::default().fg(Color::Rgb(100, 100, 120))),
+            ));
+            spans.push(Span::styled(
+                msg.name.clone(),
+                style_with_bg(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ));
+            spans.push(Span::styled(
+                ": ",
+                style_with_bg(Style::default().fg(Color::Rgb(100, 100, 120))),
+            ));
+        } else {
+            // Continuation lines: indent to align with content
+            spans.push(Span::styled(
+                indent.clone(),
+                style_with_bg(Style::default()),
+            ));
+        }
+
+        // Add styled content for this line
+        for seg_span in content_spans(content_line) {
+            spans.push(Span::styled(
+                seg_span.content,
+                style_with_bg(seg_span.style),
+            ));
+        }
+
+        // Reply indicator on the last content line
+        if line_idx == content_lines.len() - 1 && !reply_indicator.is_empty() {
+            spans.push(Span::styled(
+                reply_indicator.clone(),
+                style_with_bg(
+                    Style::default()
+                        .fg(Color::Rgb(180, 140, 60))
+                        .add_modifier(Modifier::DIM),
+                ),
+            ));
+        }
+
+        result.push(Line::from(spans));
+    }
+
+    result
+}
+
 /// Render chat messages with text wrapping, scroll-to-bottom, selection highlighting,
 /// and thread reply count indicators.
-fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
+fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width as usize;
     let height = area.height as usize;
     if height == 0 || width == 0 {
         return;
     }
 
-    // Build all message lines with their indices
-    let mut all_lines: Vec<(usize, Line)> = Vec::new();
+    // Build display lines for each message, tracking which msg index each line belongs to.
+    // msg_line_ranges[i] = (start_line, end_line) in the flat lines vec.
+    let mut all_lines: Vec<Line> = Vec::new();
+    let mut msg_line_ranges: Vec<(usize, usize)> = Vec::new();
+
     for (i, msg) in app.messages.iter().enumerate() {
-        let time_str = msg.time.format("%H:%M").to_string();
         let is_selected = app.selected_message == Some(i);
-
-        // Build the reply indicator
-        let reply_indicator = if msg.reply_count > 0 {
-            format!(" [{} replies]", msg.reply_count)
-        } else if !msg.thread.is_empty() {
-            " [thread]".to_string()
-        } else {
-            String::new()
-        };
-
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", time_str),
-                Style::default().fg(Color::Rgb(100, 100, 120)),
-            ),
-            Span::styled(
-                msg.name.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(": ", Style::default().fg(Color::Rgb(100, 100, 120))),
-            Span::raw(&msg.content),
-            Span::styled(
-                reply_indicator,
-                Style::default()
-                    .fg(Color::Rgb(180, 140, 60))
-                    .add_modifier(Modifier::DIM),
-            ),
-        ]);
-
-        if is_selected {
-            // Highlight the entire line for selected message
-            let styled_line = Line::from(
-                line.spans
-                    .into_iter()
-                    .map(|s| {
-                        Span::styled(
-                            s.content,
-                            s.style.bg(Color::Rgb(50, 50, 70)),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            all_lines.push((i, styled_line));
-        } else {
-            all_lines.push((i, line));
-        }
+        let start = all_lines.len();
+        all_lines.extend(build_message_lines(msg, is_selected));
+        msg_line_ranges.push((start, all_lines.len()));
     }
 
-    // If a message is selected, ensure it's visible by computing scroll
-    // Otherwise, show newest messages at the bottom (scroll_offset = 0 means bottom)
-    let lines: Vec<Line> = all_lines.iter().map(|(_, l)| l.clone()).collect();
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-
-    // Calculate total wrapped height
+    let paragraph = Paragraph::new(Text::from(all_lines.clone())).wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width);
 
     if let Some(sel_idx) = app.selected_message {
-        // Build partial text up to and including selected line to find its y position
-        let lines_before: Vec<Line> = all_lines
-            .iter()
-            .take(sel_idx + 1)
-            .map(|(_, l)| l.clone())
-            .collect();
-        let partial = Paragraph::new(Text::from(lines_before)).wrap(Wrap { trim: false });
-        let y_end = partial.line_count(area.width);
+        // Compute wrapped y positions for the selected message
+        let (sel_start_line, sel_end_line) = msg_line_ranges
+            .get(sel_idx)
+            .copied()
+            .unwrap_or((0, 0));
 
-        let lines_before_sel: Vec<Line> = all_lines
-            .iter()
-            .take(sel_idx)
-            .map(|(_, l)| l.clone())
-            .collect();
-        let y_start = if lines_before_sel.is_empty() {
+        let y_start = if sel_start_line == 0 {
             0
         } else {
-            Paragraph::new(Text::from(lines_before_sel))
+            Paragraph::new(Text::from(all_lines[..sel_start_line].to_vec()))
                 .wrap(Wrap { trim: false })
                 .line_count(area.width)
         };
+        let y_end = Paragraph::new(Text::from(all_lines[..sel_end_line].to_vec()))
+            .wrap(Wrap { trim: false })
+            .line_count(area.width);
 
-        // Determine scroll so selected message is visible
-        // We want to keep the view stable, scrolling only if needed
-        let scroll_bottom = if line_count > height {
-            line_count - height
-        } else {
-            0
-        };
+        let max_scroll = line_count.saturating_sub(height);
 
-        // Current view: [scroll_y .. scroll_y + height]
-        // We need y_start >= scroll_y and y_end <= scroll_y + height
+        // Keep view stable: only scroll when selected message goes off-screen
         let scroll_y = if y_start < app.chat_scroll {
+            // Selected message is above viewport — scroll up to show it at top
             y_start
         } else if y_end > app.chat_scroll + height {
+            // Selected message is below viewport — scroll down to show it at bottom
             y_end.saturating_sub(height)
         } else {
-            app.chat_scroll.min(scroll_bottom)
+            // Selected message is visible — don't move
+            app.chat_scroll.min(max_scroll)
         };
 
-        // Store scroll for next frame (can't mutate app here since it's &App)
-        // Instead, just use the computed scroll
-        let paragraph = Paragraph::new(Text::from(
-            all_lines.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
-        ))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y as u16, 0));
+        // Persist scroll position for next frame
+        app.chat_scroll = scroll_y;
+
+        let paragraph = Paragraph::new(Text::from(all_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y as u16, 0));
         frame.render_widget(paragraph, area);
     } else {
         // No selection: scroll to bottom, with chat_scroll as offset from bottom
         let max_scroll = line_count.saturating_sub(height);
-        // Clamp chat_scroll to actual content range
         let clamped_scroll = app.chat_scroll.min(max_scroll);
         let scroll_y = max_scroll.saturating_sub(clamped_scroll);
 
-        let paragraph = Paragraph::new(Text::from(
-            all_lines.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
-        ))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y as u16, 0));
+        let paragraph = Paragraph::new(Text::from(all_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y as u16, 0));
         frame.render_widget(paragraph, area);
     }
 }
 
 /// Render the input box inside the chat pane.
 fn render_input_box(frame: &mut Frame, app: &App, area: Rect) {
+    let title = if app.reply_thread_ts.is_some() {
+        " reply "
+    } else {
+        ""
+    };
+    let border_color = if app.reply_thread_ts.is_some() {
+        Color::Rgb(180, 140, 60)
+    } else {
+        Color::Rgb(80, 80, 110)
+    };
     let input_block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(80, 80, 110)))
+        .border_style(Style::default().fg(border_color))
         .border_type(BorderType::Rounded);
 
-    let (before, after) = app
-        .input
-        .split_at(app.cursor_pos.min(app.input.len()));
+    let pos = app.cursor_pos.min(app.input.len());
+    let (before, after) = app.input.split_at(pos);
 
-    let content = Line::from(vec![
-        Span::raw(before),
-        Span::styled("\u{258e}", Style::default().fg(Color::Rgb(220, 180, 50))),
-        Span::raw(after),
-    ]);
+    // Split into lines, placing the cursor marker at the split point
+    let before_lines: Vec<&str> = before.split('\n').collect();
+    let after_lines: Vec<&str> = after.split('\n').collect();
 
-    let input = Paragraph::new(content)
+    let cursor_line_idx = before_lines.len() - 1;
+    let cursor_span = Span::styled("\u{258e}", Style::default().fg(Color::Rgb(220, 180, 50)));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Lines before the cursor line
+    for &line in &before_lines[..cursor_line_idx] {
+        lines.push(Line::from(Span::raw(line.to_string())));
+    }
+
+    // The cursor line: end of before + cursor + start of after
+    let cursor_line_before = before_lines[cursor_line_idx];
+    let cursor_line_after = after_lines[0];
+    lines.push(Line::from(vec![
+        Span::raw(cursor_line_before.to_string()),
+        cursor_span,
+        Span::raw(cursor_line_after.to_string()),
+    ]));
+
+    // Lines after the cursor line
+    for &line in &after_lines[1..] {
+        lines.push(Line::from(Span::raw(line.to_string())));
+    }
+
+    let input = Paragraph::new(lines)
         .block(input_block)
         .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
@@ -330,30 +509,12 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let lines: Vec<Line> = app
-        .thread_messages
-        .iter()
-        .map(|msg| {
-            let time_str = msg.time.format("%H:%M").to_string();
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", time_str),
-                    Style::default().fg(Color::Rgb(100, 100, 120)),
-                ),
-                Span::styled(
-                    msg.name.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(": ", Style::default().fg(Color::Rgb(100, 100, 120))),
-                Span::raw(&msg.content),
-            ])
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    for msg in &app.thread_messages {
+        lines.extend(build_message_lines(msg, false));
+    }
 
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
 
     // Scroll to bottom for threads too, clamped to content range
     let line_count = paragraph.line_count(inner.width);
@@ -361,30 +522,9 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
     let clamped_scroll = app.thread_scroll.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(clamped_scroll) as u16;
 
-    let paragraph = Paragraph::new(
-        app.thread_messages
-            .iter()
-            .map(|msg| {
-                let time_str = msg.time.format("%H:%M").to_string();
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", time_str),
-                        Style::default().fg(Color::Rgb(100, 100, 120)),
-                    ),
-                    Span::styled(
-                        msg.name.clone(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(": ", Style::default().fg(Color::Rgb(100, 100, 120))),
-                    Span::raw(&msg.content),
-                ])
-            })
-            .collect::<Vec<_>>(),
-    )
-    .wrap(Wrap { trim: false })
-    .scroll((scroll_y, 0));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
 
     frame.render_widget(paragraph, inner);
 }
@@ -392,19 +532,29 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
 /// Render the status bar at the bottom.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let content = match app.mode {
-        Mode::Insert => Line::from(vec![
-            Span::styled(
-                " INSERT ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(100, 200, 140))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " Press Escape to return to command mode",
-                Style::default().fg(Color::Rgb(100, 100, 120)),
-            ),
-        ]),
+        Mode::Insert => {
+            let mut spans = vec![
+                Span::styled(
+                    " INSERT ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(100, 200, 140))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !app.status.is_empty() && app.status != "-- INSERT --" {
+                spans.push(Span::styled(
+                    format!(" {}", &app.status),
+                    Style::default().fg(Color::Rgb(180, 140, 60)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    " Escape to exit",
+                    Style::default().fg(Color::Rgb(100, 100, 120)),
+                ));
+            }
+            Line::from(spans)
+        }
         Mode::Search => Line::from(vec![
             Span::styled(
                 " SEARCH ",
@@ -472,12 +622,12 @@ mod tests {
 
     #[test]
     fn test_render_does_not_panic_empty() {
-        let app = test_app();
+        let mut app = test_app();
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -500,7 +650,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -519,7 +669,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -540,7 +690,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -561,7 +711,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -581,7 +731,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -597,7 +747,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
@@ -612,19 +762,19 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }
 
     #[test]
     fn test_render_small_terminal() {
-        let app = test_app();
+        let mut app = test_app();
         let backend = ratatui::backend::TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, &app);
+                render(frame, &mut app);
             })
             .unwrap();
     }

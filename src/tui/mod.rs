@@ -1,7 +1,10 @@
 mod layout;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -39,10 +42,14 @@ pub struct App {
     // Input buffer
     pub input: String,
     pub cursor_pos: usize,
+    pub reply_thread_ts: Option<String>,
 
     // Search state
     pub search_input: String,
     pub last_search_match: Option<usize>,
+
+    // Current user info (for optimistic updates)
+    pub current_user_name: String,
 
     // Status / mode indicator
     pub status: String,
@@ -66,8 +73,10 @@ impl App {
             thread_visible: false,
             input: String::new(),
             cursor_pos: 0,
+            reply_thread_ts: None,
             search_input: String::new(),
             last_search_match: None,
+            current_user_name: String::new(),
             status: String::new(),
         }
     }
@@ -289,6 +298,11 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     svc.init().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
     let mut app = App::new(config);
+    app.current_user_name = svc
+        .user_cache
+        .get(&svc.current_user_id)
+        .cloned()
+        .unwrap_or_else(|| "me".to_string());
     app.status = "Loading channels...".to_string();
 
     // Load channels
@@ -317,8 +331,16 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // Enable keyboard enhancement for Shift+Enter etc. (ignored if unsupported)
+    let _ = stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+    ));
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    // Splash screen
+    show_splash(&mut terminal).await?;
 
     // Main loop
     let result = async_main_loop(
@@ -331,15 +353,58 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     .await;
 
     // Restore terminal
+    let _ = stdout().execute(PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
 
     result
 }
 
+/// Show an animated splash screen. Typewriter effect, then wait for any key.
+async fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    // Total characters to animate (logo + welcome message)
+    // We'll reveal ~4 chars per frame at 30ms intervals for a snappy typewriter
+    let total_frames = 120; // enough to cover logo + message + hint
+    let chars_per_frame = 3;
+
+    for frame_idx in 0..=total_frames {
+        let char_count = frame_idx * chars_per_frame;
+        terminal.draw(|f| {
+            layout::render_splash(f, char_count);
+        })?;
+
+        // Check if user pressed a key to skip
+        if event::poll(Duration::from_millis(25))? {
+            if let Event::Key(_) = event::read()? {
+                // Draw the fully revealed splash once, then break
+                terminal.draw(|f| {
+                    layout::render_splash(f, 9999);
+                })?;
+                break;
+            }
+        }
+    }
+
+    // Wait for any key press to dismiss (with a timeout so it auto-dismisses)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(_) = event::read()? {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Actions that need async processing (sent from key handler to main loop).
 enum AsyncAction {
-    SendMessage { text: String },
+    SendMessage { text: String, thread_ts: Option<String> },
     SelectChannel { index: usize },
     OpenThread { channel_id: String, thread_ts: String },
 }
@@ -392,9 +457,12 @@ async fn async_main_loop(
 async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
     let (ch_id, oldest_ts) = match app.current_channel() {
         Some(ch) => {
+            // Use the last real (non-optimistic) message timestamp
             let oldest = app
                 .messages
-                .last()
+                .iter()
+                .rev()
+                .find(|m| !m.timestamp.starts_with("optimistic_"))
                 .map(|m| m.timestamp.clone())
                 .unwrap_or_default();
             (ch.id.clone(), oldest)
@@ -408,6 +476,8 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
 
     match svc.get_new_messages(&ch_id, &oldest_ts).await {
         Ok(new_msgs) if !new_msgs.is_empty() => {
+            // Remove optimistic messages — real ones are arriving
+            app.messages.retain(|m| !m.timestamp.starts_with("optimistic_"));
             app.messages.extend(new_msgs);
             app.chat_scroll = 0; // Scroll to bottom on new messages
         }
@@ -421,21 +491,9 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
 /// Handle async actions triggered by key events.
 async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: AsyncAction) {
     match action {
-        AsyncAction::SendMessage { text } => {
+        AsyncAction::SendMessage { text, thread_ts } => {
             if let Some(ch) = app.current_channel() {
                 let ch_id = ch.id.clone();
-                // Determine if we're in a thread
-                let thread_ts = if app.focus == Focus::Thread && !app.thread_messages.is_empty() {
-                    // Find the thread parent ts
-                    app.thread_messages.first().map(|m| {
-                        // The first message in thread_messages is the parent
-                        // We need the original timestamp, not the hash
-                        m.id.clone()
-                    })
-                } else {
-                    None
-                };
-
                 if let Err(e) = svc.send(&ch_id, &text, thread_ts.as_deref()).await {
                     app.status = format!("Send error: {}", e);
                 }
@@ -449,7 +507,6 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 app.selected_message = None;
                 app.thread_messages.clear();
                 app.thread_visible = false;
-                app.focus = Focus::Channels;
 
                 let ch_id = app.channels[index].id.clone();
                 app.channels[index].notification = false;
@@ -525,10 +582,32 @@ fn dispatch_action(
         // Mode switching
         "mode-insert" => {
             app.mode = Mode::Insert;
+            app.reply_thread_ts = None;
             app.status = "-- INSERT --".to_string();
+        }
+        "reply" => {
+            // Enter insert mode replying to the selected message's thread
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    let thread_ts = if !msg.thread.is_empty() {
+                        msg.thread.clone()
+                    } else {
+                        msg.timestamp.clone()
+                    };
+                    let reply_to_name = msg.name.clone();
+                    app.reply_thread_ts = Some(thread_ts);
+                    app.mode = Mode::Insert;
+                    app.status = format!("replying to {}", reply_to_name);
+                }
+            } else {
+                app.mode = Mode::Insert;
+                app.reply_thread_ts = None;
+                app.status = "-- INSERT --".to_string();
+            }
         }
         "mode-command" => {
             app.mode = Mode::Command;
+            app.reply_thread_ts = None;
             app.status.clear();
         }
         "mode-search" => {
@@ -657,14 +736,68 @@ fn dispatch_action(
                 app.input_char(' ');
             }
         }
+        "newline" => {
+            let (_, line_before) = current_line_info(&app.input, app.cursor_pos);
+            let prefix = bullet_prefix(line_before).to_string();
+            app.input_char('\n');
+            if !prefix.is_empty() {
+                // Auto-continue bullet on new line
+                for c in prefix.chars() {
+                    app.input_char(c);
+                }
+            }
+        }
+        "indent" => {
+            let (line_start, line_before) = current_line_info(&app.input, app.cursor_pos);
+            let prefix = bullet_prefix(line_before);
+            if !prefix.is_empty() {
+                // Add 2 spaces at line start to indent the bullet
+                app.input.insert_str(line_start, "  ");
+                app.cursor_pos += 2;
+            }
+        }
+        "dedent" => {
+            let (line_start, line_before) = current_line_info(&app.input, app.cursor_pos);
+            let prefix = bullet_prefix(line_before);
+            if !prefix.is_empty() && line_before.starts_with("  ") {
+                // Remove 2 spaces from line start
+                app.input.drain(line_start..line_start + 2);
+                app.cursor_pos -= 2;
+            }
+        }
+        "toggle-bold" => {
+            insert_wrap_markers(app, '*');
+        }
+        "toggle-italic" => {
+            insert_wrap_markers(app, '_');
+        }
+        "toggle-underline" => {
+            // Slack doesn't have underline, but we can approximate with italic
+            insert_wrap_markers(app, '_');
+        }
 
         // Send message
         "send" => {
-            let text = app.take_input();
+            let raw = app.take_input();
+            let thread_ts = app.reply_thread_ts.take();
+            // Convert hyphen bullets to Unicode bullets
+            let text = convert_bullets(&raw);
             if !text.is_empty() {
-                let _ = action_tx.send(AsyncAction::SendMessage { text });
+                // Optimistic update: show message immediately
+                let optimistic = Message::new(
+                    format!("optimistic_{}", app.messages.len()),
+                    app.current_user_name.clone(),
+                    text.clone(),
+                    chrono::Local::now(),
+                );
+                if thread_ts.is_none() {
+                    app.messages.push(optimistic);
+                }
+                let _ = action_tx.send(AsyncAction::SendMessage { text, thread_ts });
             }
             app.mode = Mode::Command;
+            app.chat_scroll = 0;
+            app.selected_message = None;
             app.status.clear();
         }
 
@@ -704,6 +837,52 @@ fn dispatch_action(
     }
 }
 
+/// Get the current line's content (from the last newline before cursor to the next newline or end).
+/// Returns (line_start_byte_offset, line_text_before_cursor).
+fn current_line_info(input: &str, cursor_pos: usize) -> (usize, &str) {
+    let before = &input[..cursor_pos];
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line_start, &before[line_start..])
+}
+
+/// Extract the bullet prefix from a line (e.g. "  - " -> "  - ", "- " -> "- ", "" otherwise).
+fn bullet_prefix(line: &str) -> &str {
+    // Match optional leading whitespace followed by "- "
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") {
+        let indent_len = line.len() - trimmed.len();
+        &line[..indent_len + 2] // indent + "- "
+    } else {
+        ""
+    }
+}
+
+/// Convert `- ` at the start of lines to `• ` (Unicode bullet).
+/// Preserves leading whitespace for indented bullets.
+fn convert_bullets(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("- ") {
+                let indent = &line[..line.len() - trimmed.len()];
+                format!("{}• {}", indent, &trimmed[2..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Insert formatting markers (e.g. `*` for bold) around the cursor.
+/// Places `marker` on both sides and positions cursor between them.
+fn insert_wrap_markers(app: &mut App, marker: char) {
+    app.input.insert(app.cursor_pos, marker);
+    app.cursor_pos += marker.len_utf8();
+    app.input.insert(app.cursor_pos, marker);
+    // Cursor stays between the two markers
+}
+
 /// Try to open the thread for the currently selected message.
 fn try_open_thread(app: &mut App, action_tx: &mpsc::UnboundedSender<AsyncAction>) {
     let Some(idx) = app.selected_message else {
@@ -739,16 +918,24 @@ fn try_open_thread(app: &mut App, action_tx: &mpsc::UnboundedSender<AsyncAction>
 /// Convert a crossterm key event to the config key string format.
 fn key_to_string(code: KeyCode, modifiers: KeyModifiers) -> String {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let sup = modifiers.contains(KeyModifiers::SUPER);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
 
     match code {
         KeyCode::Char(c) => {
-            if ctrl {
+            if ctrl || sup {
                 format!("C-{}", c)
             } else {
                 c.to_string()
             }
         }
-        KeyCode::Enter => "<enter>".to_string(),
+        KeyCode::Enter => {
+            if shift {
+                "<s-enter>".to_string()
+            } else {
+                "<enter>".to_string()
+            }
+        }
         KeyCode::Esc => "<escape>".to_string(),
         KeyCode::Backspace => "<backspace>".to_string(),
         KeyCode::Delete => "<delete>".to_string(),
@@ -761,6 +948,7 @@ fn key_to_string(code: KeyCode, modifiers: KeyModifiers) -> String {
         KeyCode::Home => "<home>".to_string(),
         KeyCode::End => "<end>".to_string(),
         KeyCode::Tab => "<tab>".to_string(),
+        KeyCode::BackTab => "<s-tab>".to_string(),
         KeyCode::F(n) => format!("<f{}>", n),
         _ => String::new(),
     }
@@ -1179,5 +1367,127 @@ mod tests {
 
         let result = app.channel_search_next();
         assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn test_convert_bullets() {
+        assert_eq!(convert_bullets("- item one\n- item two"), "• item one\n• item two");
+        assert_eq!(convert_bullets("no bullets here"), "no bullets here");
+        assert_eq!(convert_bullets("- first\nnot a bullet\n- third"), "• first\nnot a bullet\n• third");
+        assert_eq!(convert_bullets("  - indented"), "  • indented");
+        assert_eq!(convert_bullets("    - deep"), "    • deep");
+    }
+
+    #[test]
+    fn test_bullet_prefix() {
+        assert_eq!(bullet_prefix("- item"), "- ");
+        assert_eq!(bullet_prefix("  - item"), "  - ");
+        assert_eq!(bullet_prefix("    - item"), "    - ");
+        assert_eq!(bullet_prefix("no bullet"), "");
+        assert_eq!(bullet_prefix(""), "");
+    }
+
+    #[test]
+    fn test_current_line_info() {
+        let (start, text) = current_line_info("line1\nline2", 8);
+        assert_eq!(start, 6);
+        assert_eq!(text, "li");
+
+        let (start, text) = current_line_info("hello", 3);
+        assert_eq!(start, 0);
+        assert_eq!(text, "hel");
+    }
+
+    #[test]
+    fn test_newline_continues_bullet() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "- item one".to_string();
+        app.cursor_pos = 10;
+        dispatch_action(&mut app, "newline".to_string(), &tx);
+        assert_eq!(app.input, "- item one\n- ");
+        assert_eq!(app.cursor_pos, 13);
+    }
+
+    #[test]
+    fn test_newline_continues_indented_bullet() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "  - sub item".to_string();
+        app.cursor_pos = 12;
+        dispatch_action(&mut app, "newline".to_string(), &tx);
+        assert_eq!(app.input, "  - sub item\n  - ");
+        assert_eq!(app.cursor_pos, 17);
+    }
+
+    #[test]
+    fn test_indent_bullet() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "- item".to_string();
+        app.cursor_pos = 6;
+        dispatch_action(&mut app, "indent".to_string(), &tx);
+        assert_eq!(app.input, "  - item");
+        assert_eq!(app.cursor_pos, 8);
+    }
+
+    #[test]
+    fn test_dedent_bullet() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "  - item".to_string();
+        app.cursor_pos = 8;
+        dispatch_action(&mut app, "dedent".to_string(), &tx);
+        assert_eq!(app.input, "- item");
+        assert_eq!(app.cursor_pos, 6);
+    }
+
+    #[test]
+    fn test_indent_no_bullet_noop() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "plain text".to_string();
+        app.cursor_pos = 10;
+        dispatch_action(&mut app, "indent".to_string(), &tx);
+        assert_eq!(app.input, "plain text");
+    }
+
+    #[test]
+    fn test_insert_wrap_markers() {
+        let mut app = test_app();
+        app.input = "hello".to_string();
+        app.cursor_pos = 5;
+        insert_wrap_markers(&mut app, '*');
+        assert_eq!(app.input, "hello**");
+        assert_eq!(app.cursor_pos, 6); // between the two *s
+    }
+
+    #[test]
+    fn test_newline_in_input() {
+        let mut app = test_app();
+        let tx = test_action_tx();
+        app.mode = Mode::Insert;
+        app.input = "line1".to_string();
+        app.cursor_pos = 5;
+        dispatch_action(&mut app, "newline".to_string(), &tx);
+        assert_eq!(app.input, "line1\n");
+        assert_eq!(app.cursor_pos, 6);
+    }
+
+    #[test]
+    fn test_key_to_string_shift_enter() {
+        assert_eq!(
+            key_to_string(KeyCode::Enter, KeyModifiers::SHIFT),
+            "<s-enter>"
+        );
+        assert_eq!(
+            key_to_string(KeyCode::Enter, KeyModifiers::NONE),
+            "<enter>"
+        );
     }
 }
