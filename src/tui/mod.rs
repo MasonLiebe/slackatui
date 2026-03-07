@@ -19,7 +19,8 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::service::SlackService;
-use crate::types::{ChannelItem, Focus, Message, Mode};
+use crate::slack::rtm::{self, RtmEvent};
+use crate::types::{ChannelItem, ChannelType, Focus, Message, Mode};
 
 /// Application state shared across all TUI components.
 pub struct App {
@@ -70,6 +71,15 @@ pub struct App {
     // Staged files waiting to be uploaded (from drag-and-drop)
     pub staged_files: Vec<String>,
 
+    // Per-channel last-seen message timestamp (for unread detection)
+    pub last_read_ts: HashMap<String, String>,
+    pub unread_poll_cursor: usize,
+
+    // Own presence/status
+    pub own_presence: String,
+    pub own_status_text: String,
+    pub own_status_emoji: String,
+
     // Status / mode indicator
     pub status: String,
 }
@@ -104,6 +114,11 @@ impl App {
             image_cache: HashMap::new(),
             upload_path: String::new(),
             staged_files: Vec::new(),
+            last_read_ts: HashMap::new(),
+            unread_poll_cursor: 0,
+            own_presence: "active".to_string(),
+            own_status_text: String::new(),
+            own_status_emoji: String::new(),
             status: String::new(),
         }
     }
@@ -334,9 +349,27 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
         .unwrap_or_else(|| "me".to_string());
     app.status = "Loading channels...".to_string();
 
+    // Set own presence to auto (makes us show as active)
+    let _ = svc.client.set_user_presence("auto").await;
+    app.own_presence = "active".to_string();
+
+    // Load own status
+    if let Ok(profile) = svc.client.get_user_profile(&app.current_user_id).await {
+        app.own_status_text = profile.status_text;
+        app.own_status_emoji = profile.status_emoji;
+    }
+
     // Load channels
     match svc.get_channels().await {
-        Ok(channels) => {
+        Ok(mut channels) => {
+            // Fetch presence for DM contacts
+            for ch in &mut channels {
+                if ch.channel_type == crate::types::ChannelType::IM && !ch.user_id.is_empty() {
+                    if let Ok(p) = svc.client.get_user_presence(&ch.user_id).await {
+                        ch.presence = p;
+                    }
+                }
+            }
             app.channels = channels;
             app.status.clear();
         }
@@ -349,10 +382,18 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     if let Some(ch) = app.current_channel() {
         let ch_id = ch.id.clone();
         match svc.get_messages(&ch_id, 50).await {
-            Ok(msgs) => app.messages = msgs,
+            Ok(msgs) => {
+                if let Some(last) = msgs.last() {
+                    app.last_read_ts.insert(ch_id.clone(), last.timestamp.clone());
+                }
+                app.messages = msgs;
+            }
             Err(e) => app.status = format!("Error loading messages: {}", e),
         }
     }
+
+    // Start RTM WebSocket connection for real-time events
+    let mut rtm_rx = rtm::start_rtm(svc.client.clone());
 
     // Create a channel for async actions triggered by key events
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AsyncAction>();
@@ -384,6 +425,7 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
         &mut svc,
         &action_tx,
         &mut action_rx,
+        &mut rtm_rx,
     )
     .await;
 
@@ -449,9 +491,12 @@ enum AsyncAction {
     ToggleReaction { channel_id: String, timestamp: String, emoji_name: String, msg_idx: usize },
     OpenFile { file_id: String, url: String, title: String, is_image: bool },
     UploadFile { channel_id: String, file_path: String, thread_ts: Option<String> },
+    TogglePresence,
+    SetStatus { text: String, emoji: String },
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+const UNREAD_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The async main event loop: render, poll for keyboard events and new messages.
 async fn async_main_loop(
@@ -460,10 +505,13 @@ async fn async_main_loop(
     svc: &mut SlackService,
     action_tx: &mpsc::UnboundedSender<AsyncAction>,
     action_rx: &mut mpsc::UnboundedReceiver<AsyncAction>,
+    rtm_rx: &mut mpsc::UnboundedReceiver<RtmEvent>,
 ) -> io::Result<()> {
     let mut poll_timer = tokio::time::interval(POLL_INTERVAL);
+    let mut unread_timer = tokio::time::interval(UNREAD_POLL_INTERVAL);
     // Skip the first immediate tick
     poll_timer.tick().await;
+    unread_timer.tick().await;
 
     while app.running {
         terminal.draw(|frame| {
@@ -486,14 +534,24 @@ async fn async_main_loop(
                 }
             }
 
-            // Poll for new messages periodically
+            // Poll for new messages in the current channel
             _ = poll_timer.tick() => {
                 poll_new_messages(app, svc).await;
+            }
+
+            // Poll for unreads across all channels
+            _ = unread_timer.tick() => {
+                poll_unreads(app, svc).await;
             }
 
             // Async actions from key handlers
             Some(action) = action_rx.recv() => {
                 handle_async_action(app, svc, action).await;
+            }
+
+            // RTM real-time events
+            Some(rtm_event) = rtm_rx.recv() => {
+                handle_rtm_event(app, svc, rtm_event).await;
             }
         }
     }
@@ -503,7 +561,7 @@ async fn async_main_loop(
 
 /// Poll the active channel for new messages since the last known message.
 async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
-    let (ch_id, oldest_ts) = match app.current_channel() {
+    let (ch_id, ch_name, ch_type, oldest_ts) = match app.current_channel() {
         Some(ch) => {
             // Use the last real (non-optimistic) message timestamp
             let oldest = app
@@ -513,7 +571,7 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
                 .find(|m| !m.timestamp.starts_with("optimistic_"))
                 .map(|m| m.timestamp.clone())
                 .unwrap_or_default();
-            (ch.id.clone(), oldest)
+            (ch.id.clone(), ch.name.clone(), ch.channel_type, oldest)
         }
         None => return,
     };
@@ -524,9 +582,21 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
 
     match svc.get_new_messages(&ch_id, &oldest_ts).await {
         Ok(new_msgs) if !new_msgs.is_empty() => {
+            // Notify for messages from others
+            for msg in &new_msgs {
+                if msg.name != app.current_user_name {
+                    let is_dm = ch_type == ChannelType::IM;
+                    let is_mention = msg.content.contains(&format!("@{}", app.current_user_name));
+                    send_notification(app, &msg.name, &msg.content, &ch_name, is_dm, is_mention);
+                }
+            }
             // Remove optimistic messages — real ones are arriving
             app.messages.retain(|m| !m.timestamp.starts_with("optimistic_"));
             app.messages.extend(new_msgs);
+            // Update last-read ts for current channel
+            if let Some(last) = app.messages.last() {
+                app.last_read_ts.insert(ch_id.clone(), last.timestamp.clone());
+            }
             app.chat_scroll = 0; // Scroll to bottom on new messages
         }
         Err(_) => {
@@ -534,6 +604,202 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
         }
         _ => {}
     }
+}
+
+/// Number of channels to check for unreads per poll cycle.
+const UNREAD_BATCH_SIZE: usize = 5;
+
+/// Poll a batch of channels (round-robin) for new messages since last read.
+async fn poll_unreads(app: &mut App, svc: &mut SlackService) {
+    if app.channels.is_empty() {
+        return;
+    }
+
+    let current_ch_id = app.current_channel().map(|c| c.id.clone());
+    let total = app.channels.len();
+    let start = app.unread_poll_cursor % total;
+
+    for offset in 0..UNREAD_BATCH_SIZE.min(total) {
+        let idx = (start + offset) % total;
+        let ch_id = app.channels[idx].id.clone();
+        let ch_name = app.channels[idx].name.clone();
+        let ch_type = app.channels[idx].channel_type;
+
+        // Skip the channel we're currently viewing
+        if current_ch_id.as_deref() == Some(&ch_id) {
+            continue;
+        }
+
+        // Skip if already marked as unread
+        if app.channels[idx].notification {
+            continue;
+        }
+
+        // Get the last-read timestamp for this channel (if none, use "0" to skip)
+        let oldest = match app.last_read_ts.get(&ch_id) {
+            Some(ts) => ts.clone(),
+            None => {
+                // First time seeing this channel — fetch 1 message to establish a baseline
+                if let Ok(msgs) = svc.client.get_conversation_history(&ch_id, 1).await {
+                    if let Some(m) = msgs.first() {
+                        app.last_read_ts.insert(ch_id.clone(), m.timestamp.clone());
+                    }
+                }
+                continue;
+            }
+        };
+
+        // Check for messages newer than last-read
+        match svc.client.get_new_messages(&ch_id, &oldest).await {
+            Ok(new_msgs) if !new_msgs.is_empty() => {
+                // Filter out own messages
+                let from_others: Vec<_> = new_msgs.iter()
+                    .filter(|m| m.user != app.current_user_id)
+                    .collect();
+
+                if !from_others.is_empty() {
+                    app.channels[idx].notification = true;
+
+                    // Notify with the latest message
+                    let latest = from_others.last().unwrap();
+                    let sender = svc.user_cache
+                        .get(&latest.user)
+                        .cloned()
+                        .unwrap_or_else(|| latest.user.clone());
+                    let content = crate::parse::parse_message(
+                        &latest.text, svc.emoji_enabled, &svc.user_cache,
+                    );
+                    let is_dm = ch_type == ChannelType::IM;
+                    let is_mention = latest.text.contains(&format!("<@{}>", app.current_user_id));
+                    send_notification(app, &sender, &content, &ch_name, is_dm, is_mention);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    app.unread_poll_cursor = (start + UNREAD_BATCH_SIZE) % total.max(1);
+}
+
+/// Handle real-time events from the RTM WebSocket.
+async fn handle_rtm_event(app: &mut App, svc: &mut SlackService, event: RtmEvent) {
+    match event {
+        RtmEvent::PresenceChange(ev) => {
+            // Update own presence
+            if ev.user == app.current_user_id {
+                app.own_presence = ev.presence.clone();
+            }
+            // Update presence for DM channels matching this user
+            for ch in &mut app.channels {
+                if ch.user_id == ev.user {
+                    ch.presence = ev.presence.clone();
+                }
+            }
+        }
+        RtmEvent::Message(msg) => {
+            // Ignore subtypes (message_changed, etc.) for now
+            if !msg.sub_type.is_empty() {
+                return;
+            }
+            // Ignore own messages
+            if msg.user == app.current_user_id {
+                return;
+            }
+
+            let name = svc.resolve_user_or_bot(&msg.user, &msg.bot_id, &msg.username);
+            let content = crate::parse::parse_message(&msg.text, svc.emoji_enabled, &svc.user_cache);
+
+            let current_ch_id = app.current_channel().map(|c| c.id.clone());
+            let is_current = current_ch_id.as_deref() == Some(&msg.channel);
+
+            // Add message to view if it's the current channel
+            if is_current {
+                let time = crate::service::parse_slack_timestamp(&msg.ts);
+                let hash = crate::parse::hash_id(&msg.ts);
+                let mut m = Message::new(msg.ts.clone(), name.clone(), content.clone(), time);
+                m.id = hash;
+                if !msg.thread_ts.is_empty() {
+                    m.thread = msg.thread_ts.clone();
+                }
+                app.messages.retain(|m| !m.timestamp.starts_with("optimistic_"));
+                app.messages.push(m);
+                app.chat_scroll = 0;
+            } else {
+                // Mark channel as having unread notification
+                for ch in &mut app.channels {
+                    if ch.id == msg.channel {
+                        ch.notification = true;
+                        break;
+                    }
+                }
+            }
+
+            // OS notification
+            let channel_name = app.channels.iter()
+                .find(|c| c.id == msg.channel)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| msg.channel.clone());
+            let is_dm = app.channels.iter()
+                .any(|c| c.id == msg.channel && c.channel_type == ChannelType::IM);
+            let is_mention = msg.text.contains(&format!("<@{}>", app.current_user_id));
+
+            send_notification(app, &name, &content, &channel_name, is_dm, is_mention);
+        }
+        RtmEvent::Connected => {}
+        RtmEvent::Disconnected => {}
+        RtmEvent::Error(_) => {}
+    }
+}
+
+/// Send an OS notification and terminal bell if the notify config allows it.
+fn send_notification(
+    app: &mut App,
+    sender: &str,
+    content: &str,
+    channel_name: &str,
+    is_dm: bool,
+    is_mention: bool,
+) {
+    let should_notify = match app.config.notify.as_str() {
+        crate::config::NOTIFY_ALL => true,
+        crate::config::NOTIFY_MENTION => is_mention || is_dm,
+        _ => false, // notifications disabled
+    };
+    if !should_notify {
+        return;
+    }
+
+    let title = if is_dm {
+        format!("{} (DM)", sender)
+    } else {
+        format!("{} in #{}", sender, channel_name)
+    };
+
+    // Flash the status bar with the notification
+    let preview: String = content.chars().take(80).collect();
+    app.status = format!("{}: {}", title, preview);
+
+    // Ring the terminal bell
+    let _ = stdout().execute(crossterm::style::Print("\x07"));
+
+    // Truncate body for OS notification
+    let body: String = content.chars().take(200).collect();
+
+    // Use osascript for reliable macOS notifications with sound
+    let title_owned = title;
+    let body_owned = body;
+    std::thread::spawn(move || {
+        // Escape quotes for AppleScript
+        let escaped_title = title_owned.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_body = body_owned.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{}\" with title \"{}\" sound name \"Funk\"",
+                escaped_body, escaped_title
+            ))
+            .output();
+    });
 }
 
 /// Handle async actions triggered by key events.
@@ -555,6 +821,16 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
         }
         AsyncAction::SelectChannel { index } => {
             if index < app.channels.len() {
+                // Before leaving current channel, record its last-read ts
+                if let Some(ts) = app.messages.iter().rev()
+                    .find(|m| !m.timestamp.starts_with("optimistic_"))
+                    .map(|m| m.timestamp.clone())
+                {
+                    if let Some(ch) = app.current_channel() {
+                        app.last_read_ts.insert(ch.id.clone(), ts);
+                    }
+                }
+
                 app.selected_channel = index;
                 app.messages.clear();
                 app.chat_scroll = 0;
@@ -566,7 +842,15 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 app.channels[index].notification = false;
 
                 match svc.get_messages(&ch_id, 50).await {
-                    Ok(msgs) => app.messages = msgs,
+                    Ok(msgs) => {
+                        // Record the latest ts as last-read for this channel
+                        if let Some(last) = msgs.iter().rev()
+                            .find(|m| !m.timestamp.starts_with("optimistic_"))
+                        {
+                            app.last_read_ts.insert(ch_id.clone(), last.timestamp.clone());
+                        }
+                        app.messages = msgs;
+                    }
                     Err(e) => app.status = format!("Error: {}", e),
                 }
             }
@@ -728,6 +1012,30 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
                 Err(e) => {
                     app.status = format!("Upload error: {}", e);
+                }
+            }
+        }
+        AsyncAction::TogglePresence => {
+            let new_presence = if app.own_presence == "active" { "away" } else { "auto" };
+            match svc.client.set_user_presence(new_presence).await {
+                Ok(()) => {
+                    app.own_presence = if new_presence == "auto" { "active" } else { "away" }.to_string();
+                    app.status = format!("Status: {}", app.own_presence);
+                }
+                Err(e) => {
+                    app.status = format!("Presence error: {}", e);
+                }
+            }
+        }
+        AsyncAction::SetStatus { text, emoji } => {
+            match svc.client.set_user_status(&text, &emoji).await {
+                Ok(()) => {
+                    app.own_status_text = text;
+                    app.own_status_emoji = emoji;
+                    app.status = "Status updated".to_string();
+                }
+                Err(e) => {
+                    app.status = format!("Status error: {}", e);
                 }
             }
         }
@@ -1304,13 +1612,18 @@ fn dispatch_action(
             }
         }
 
+        // Toggle presence (active/away)
+        "toggle-presence" => {
+            let _ = action_tx.send(AsyncAction::TogglePresence);
+        }
+
         // Quit
         "quit" => app.running = false,
 
         // Help
         "help" => {
             app.status =
-                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload q=quit".to_string();
+                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload p=presence q=quit".to_string();
         }
 
         _ => {}

@@ -25,10 +25,23 @@ fn main() {
         }
     };
 
-    // Handle `auth` subcommand
-    if args.len() > 1 && args[1] == "auth" {
-        run_auth(&cfg);
-        return;
+    // Handle subcommands
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "auth" => {
+                run_auth(&cfg);
+                return;
+            }
+            "config" => {
+                config::run_config_wizard();
+                return;
+            }
+            other => {
+                eprintln!("Unknown command: {}", other);
+                eprintln!("Usage: slackatui [auth|config]");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Load stored token

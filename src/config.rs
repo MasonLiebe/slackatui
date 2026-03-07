@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 pub const NOTIFY_ALL: &str = "all";
@@ -205,6 +205,7 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     command.insert("e".into(), "mode-react".into());
     command.insert("o".into(), "open-file".into());
     command.insert("u".into(), "upload-file".into());
+    command.insert("p".into(), "toggle-presence".into());
     command.insert("q".into(), "quit".into());
     command.insert("<f1>".into(), "help".into());
     key_map.insert("command".into(), command);
@@ -329,6 +330,300 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+// ---- Interactive config wizard ----
+
+/// Read a line from stdin, trimmed. Returns empty string on EOF.
+fn prompt(label: &str) -> String {
+    print!("{}", label);
+    let _ = io::stdout().flush();
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
+    buf.trim().to_string()
+}
+
+/// Prompt with a default value shown in brackets. Empty input returns the default.
+fn prompt_default(label: &str, default: &str) -> String {
+    let input = prompt(&format!("{} [{}]: ", label, default));
+    if input.is_empty() { default.to_string() } else { input }
+}
+
+/// Prompt for a yes/no question. Returns bool.
+fn prompt_yn(label: &str, default: bool) -> bool {
+    let hint = if default { "Y/n" } else { "y/N" };
+    let input = prompt(&format!("{} [{}]: ", label, hint));
+    match input.to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    }
+}
+
+/// Prompt user to pick from a numbered list. Returns the chosen value.
+fn prompt_choice(label: &str, options: &[(&str, &str)], default_idx: usize) -> String {
+    println!("\n  {}", label);
+    for (i, (value, desc)) in options.iter().enumerate() {
+        let marker = if i == default_idx { " (default)" } else { "" };
+        println!("    {}. {} - {}{}", i + 1, value, desc, marker);
+    }
+    let input = prompt(&format!("  Choose [{}]: ", default_idx + 1));
+    if let Ok(n) = input.parse::<usize>() {
+        if n >= 1 && n <= options.len() {
+            return options[n - 1].0.to_string();
+        }
+    }
+    options[default_idx].0.to_string()
+}
+
+/// Run the interactive configuration wizard.
+/// Loads existing config, walks the user through each setting, preserves
+/// key_map untouched, and writes the result.
+pub fn run_config_wizard() {
+    let path = default_config_path();
+
+    // Load existing config (or defaults)
+    let existing = Config::load(&path).unwrap_or_default();
+
+    println!();
+    println!("  \x1b[1;36mslackatui configuration\x1b[0m");
+    println!("  ─────────────────────");
+    println!();
+    println!("  Walk through each setting below. Press Enter to keep the");
+    println!("  current value shown in brackets.");
+    println!();
+
+    // ── Slack App credentials ──
+    println!("  \x1b[1;33m▸ Slack App Credentials\x1b[0m");
+    println!("    These come from your Slack App at https://api.slack.com/apps");
+    println!("    under \"Basic Information\" → \"App Credentials\".");
+    println!();
+
+    let client_id = prompt_default(
+        "    Client ID",
+        if existing.auth.client_id.is_empty() { "<not set>" } else { &existing.auth.client_id },
+    );
+    let client_id = if client_id == "<not set>" { String::new() } else { client_id };
+
+    let client_secret = prompt_default(
+        "    Client Secret",
+        if existing.auth.client_secret.is_empty() { "<not set>" } else { &existing.auth.client_secret },
+    );
+    let client_secret = if client_secret == "<not set>" { String::new() } else { client_secret };
+
+    let redirect_uri = prompt_default(
+        "    Redirect URI",
+        if existing.auth.redirect_uri.is_empty() { "https://localhost:8888/auth/callback" } else { &existing.auth.redirect_uri },
+    );
+
+    // ── Token storage ──
+    println!();
+    println!("  \x1b[1;33m▸ Token Storage\x1b[0m");
+    println!("    Where to store your Slack OAuth tokens after authentication.");
+    println!();
+
+    let token_store_default = match existing.auth.token_store.as_str() {
+        "file" => 1,
+        _ => 0,
+    };
+    let token_store = prompt_choice(
+        "Token storage backend:",
+        &[
+            ("keychain", "macOS Keychain (secure, recommended)"),
+            ("file", "plain JSON file (~/.config/slackatui/tokens)"),
+        ],
+        token_store_default,
+    );
+
+    let token_pref_default = match existing.auth.token_preference.as_str() {
+        "bot" => 1,
+        _ => 0,
+    };
+    let token_preference = prompt_choice(
+        "Token preference (which token to use when both are available):",
+        &[
+            ("user", "user token (full user access, recommended)"),
+            ("bot", "bot token (limited to bot scopes)"),
+        ],
+        token_pref_default,
+    );
+
+    let team_id = prompt_default(
+        "\n    Team ID (optional, for multi-workspace)",
+        if existing.auth.team_id.is_empty() { "<auto>" } else { &existing.auth.team_id },
+    );
+    let team_id = if team_id == "<auto>" { String::new() } else { team_id };
+
+    // ── Notifications ──
+    println!();
+    println!("  \x1b[1;33m▸ Notifications\x1b[0m");
+    println!("    OS desktop notifications for incoming messages.");
+    println!();
+
+    let notify_default = match existing.notify.as_str() {
+        "all" => 1,
+        "mention" => 2,
+        _ => 0,
+    };
+    let notify = prompt_choice(
+        "When should notifications appear?",
+        &[
+            ("", "off - no desktop notifications"),
+            ("all", "all - notify on every incoming message"),
+            ("mention", "mention - only DMs and @mentions"),
+        ],
+        notify_default,
+    );
+
+    // ── Emoji ──
+    println!();
+    println!("  \x1b[1;33m▸ Emoji\x1b[0m");
+    println!("    Render :emoji_codes: as Unicode emoji characters in messages.");
+    println!();
+
+    let emoji = prompt_yn("    Enable emoji rendering?", existing.emoji);
+
+    // ── Layout ──
+    println!();
+    println!("  \x1b[1;33m▸ Layout\x1b[0m");
+    println!("    Control the proportional widths of UI panels.");
+    println!("    Total width is divided into 12 columns.");
+    println!();
+
+    let sidebar_str = prompt_default(
+        "    Sidebar width (1-5, in 12ths of screen)",
+        &existing.sidebar_width.to_string(),
+    );
+    let sidebar_width: u16 = sidebar_str.parse().unwrap_or(existing.sidebar_width).clamp(1, 5);
+
+    let threads_str = prompt_default(
+        "    Threads panel width (1-5, in 12ths of screen)",
+        &existing.threads_width.to_string(),
+    );
+    let threads_width: u16 = threads_str.parse().unwrap_or(existing.threads_width).clamp(1, 5);
+
+    // ── Theme ──
+    println!();
+    println!("  \x1b[1;33m▸ Theme\x1b[0m");
+    println!("    Customize colors. Use color names (red, green, blue, white, default)");
+    println!("    or add modifiers (e.g. \"green,bold\"). Leave blank for defaults.");
+    println!();
+
+    let view_fg = prompt_default("    View foreground", &existing.theme.view.fg);
+    let view_bg = prompt_default("    View background", &existing.theme.view.bg);
+    let border_fg = prompt_default("    Border foreground", &existing.theme.view.border_fg);
+    let label_fg = prompt_default("    Label style", &existing.theme.view.label_fg);
+
+    // ── Message display ──
+    println!();
+    println!("  \x1b[1;33m▸ Message Display\x1b[0m");
+    println!("    How messages are formatted in the chat view.");
+    println!();
+
+    let time_format_default = match existing.theme.message.time_format.as_str() {
+        "15:04:05" => 1,
+        "3:04 PM" => 2,
+        _ => 0,
+    };
+    let time_format = prompt_choice(
+        "Timestamp format:",
+        &[
+            ("15:04", "24-hour short (15:04)"),
+            ("15:04:05", "24-hour with seconds (15:04:05)"),
+            ("3:04 PM", "12-hour (3:04 PM)"),
+        ],
+        time_format_default,
+    );
+
+    // ── Presence ──
+    println!();
+    println!("  \x1b[1;33m▸ Presence\x1b[0m");
+    println!("    slackatui automatically sets you as \"active\" on launch and shows");
+    println!("    online/away indicators for DM contacts in the sidebar.");
+    println!("    Press \x1b[1mp\x1b[0m in command mode to toggle your status at any time.");
+    println!();
+
+    // ── Summary & save ──
+    println!();
+    println!("  \x1b[1;33m▸ Summary\x1b[0m");
+    println!();
+    println!("    Notifications:   {}", if notify.is_empty() { "off" } else { &notify });
+    println!("    Emoji:           {}", if emoji { "on" } else { "off" });
+    println!("    Sidebar width:   {}/12", sidebar_width);
+    println!("    Threads width:   {}/12", threads_width);
+    println!("    Time format:     {}", time_format);
+    println!("    Token storage:   {}", token_store);
+    println!();
+
+    if !prompt_yn("    Save this configuration?", true) {
+        println!("\n  Configuration not saved.");
+        return;
+    }
+
+    // Build config — preserve existing key_map untouched
+    let cfg = Config {
+        auth: AuthConfig {
+            client_id,
+            client_secret,
+            redirect_uri,
+            token_store,
+            token_preference,
+            team_id,
+        },
+        notify,
+        emoji,
+        sidebar_width,
+        main_width: 12 - sidebar_width,
+        threads_width,
+        key_map: existing.key_map,
+        theme: Theme {
+            view: ViewTheme {
+                fg: view_fg,
+                bg: view_bg,
+                border_fg,
+                border_bg: existing.theme.view.border_bg,
+                label_fg,
+                label_bg: existing.theme.view.label_bg,
+            },
+            channel: existing.theme.channel,
+            message: MessageTheme {
+                time: existing.theme.message.time,
+                time_format,
+                thread: existing.theme.message.thread,
+                name: existing.theme.message.name,
+                text: existing.theme.message.text,
+            },
+        },
+    };
+
+    // Write
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    match serde_json::to_string_pretty(&cfg) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&path, &json) {
+                eprintln!("\n  \x1b[1;31mError saving config:\x1b[0m {}", e);
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("\n  \x1b[1;31mError serializing config:\x1b[0m {}", e);
+            return;
+        }
+    }
+
+    println!();
+    println!("  \x1b[1;32m✓ Configuration saved to:\x1b[0m");
+    println!("    {}", path.display());
+    println!();
+    println!("  You can edit this file directly at any time, or re-run");
+    println!("  \x1b[1mslackatui config\x1b[0m to go through this wizard again.");
+    println!();
+    println!("  \x1b[2mNote: keybindings are preserved and can be edited");
+    println!("  directly in the config JSON under \"key_map\".\x1b[0m");
+    println!();
+}
 
 #[cfg(test)]
 mod tests {

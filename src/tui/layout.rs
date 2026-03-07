@@ -483,13 +483,19 @@ fn render_channels(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD)
             } else if ch.notification {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Rgb(80, 200, 120))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Rgb(140, 140, 160))
             };
 
-            ListItem::new(format!("{}{}", prefix, ch.display_name())).style(style)
+            let display = if ch.notification {
+                format!("{}{}  ●", prefix, ch.display_name())
+            } else {
+                format!("{}{}", prefix, ch.display_name())
+            };
+
+            ListItem::new(display).style(style)
         })
         .collect();
 
@@ -1065,6 +1071,19 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                     .bg(Color::Rgb(80, 140, 220))
                     .add_modifier(Modifier::BOLD),
             );
+
+            // Presence indicator on the right
+            let presence_icon = if app.own_presence == "active" { "●" } else { "○" };
+            let presence_color = if app.own_presence == "active" {
+                Color::Rgb(80, 200, 120)
+            } else {
+                Color::Rgb(140, 140, 160)
+            };
+            let mut presence_text = format!(" {} {}", presence_icon, app.own_presence);
+            if !app.own_status_emoji.is_empty() || !app.own_status_text.is_empty() {
+                presence_text.push_str(&format!(" {} {}", app.own_status_emoji, app.own_status_text));
+            }
+            let presence_span = Span::styled(presence_text, Style::default().fg(presence_color));
             if !app.staged_files.is_empty() {
                 let names: Vec<&str> = app
                     .staged_files
@@ -1091,12 +1110,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" Enter", Style::default().fg(Color::White)),
                     Span::styled("=upload ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("x", Style::default().fg(Color::White)),
-                    Span::styled("=clear", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("=clear ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    presence_span,
                 ])
             } else if !app.status.is_empty() {
                 Line::from(vec![
                     mode_badge,
-                    Span::raw(format!(" {}", &app.status)),
+                    Span::raw(format!(" {} ", &app.status)),
+                    presence_span,
                 ])
             } else if app.focus == Focus::Chat && app.selected_message.is_some() {
                 // Contextual hints for selected message
@@ -1123,7 +1144,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled("j/k", Style::default().fg(Color::White)));
                 spans.push(Span::styled("=nav ", Style::default().fg(Color::Rgb(100, 100, 120))));
                 spans.push(Span::styled("h", Style::default().fg(Color::White)));
-                spans.push(Span::styled("=back", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("=back ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(presence_span);
                 Line::from(spans)
             } else {
                 Line::from(vec![
@@ -1139,7 +1161,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("'", Style::default().fg(Color::White)),
                     Span::styled("=thread ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("q", Style::default().fg(Color::White)),
-                    Span::styled("=quit", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("=quit ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("p", Style::default().fg(Color::White)),
+                    Span::styled("=presence ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    presence_span,
                 ])
             }
         }

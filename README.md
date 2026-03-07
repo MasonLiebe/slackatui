@@ -5,18 +5,28 @@ A Slack client for your terminal, built with Rust and [ratatui](https://ratatui.
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+<video src="slackatui-demo.mp4" controls autoplay muted loop width="100%"></video>
+
 ## Features
 
 - Browse channels, groups, DMs, and multi-party DMs
-- Send and receive messages with polling-based updates
+- Send and receive messages with real-time polling
 - Threaded conversations with reply count indicators
 - Vim-style keybindings (command / insert / search modes)
 - Focus-based pane navigation (channels -> chat -> thread)
 - Message selection and highlighting
 - Emoji shortcode rendering (`:thumbsup:` -> 👍)
 - Mention expansion (`<@U12345>` -> `@username`)
+- Clickable hyperlinks (OSC 8 terminal links)
+- Inline image rendering (Sixel, Kitty, iTerm2, halfblocks)
+- File uploads with drag-and-drop staging
 - Channel search with `/` then `n`/`N` to cycle matches
 - Slash commands (`/status`, `/away`, etc.)
+- Desktop notifications with sound (macOS)
+- Unread indicators across all channels
+- Online presence display and toggle (`p` to go active/away)
+- Emoji reactions picker (`e` to react)
+- Interactive configuration wizard (`slackatui config`)
 - Token storage via macOS Keychain or encrypted JSON file
 
 ## Quickstart
@@ -64,24 +74,20 @@ You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.sla
    - `mpim:read`, `mpim:history`, `mpim:write`
    - `chat:write`
    - `users:read`, `users:write`
+   - `reactions:read`, `reactions:write`
+   - `files:read`, `files:write`
+   - `users.profile:read`, `users.profile:write`
 5. Note your **Client ID** and **Client Secret** from the **Basic Information** page (under "App Credentials")
 
 ### 4. Configure slackatui
 
-Run `slackatui` once — it will fail but create a default config file. Then edit it:
+Run the interactive configuration wizard:
 
 ```sh
-# Generate default config (will print an error, that's OK)
-slackatui
-
-# Edit the config (macOS — config lives in ~/Library/Application Support/)
-$EDITOR ~/Library/Application\ Support/slackatui/config
-
-# On Linux the config is at:
-# $EDITOR ~/.config/slackatui/config
+slackatui config
 ```
 
-Set your Client ID, Client Secret, and redirect URI in the config JSON:
+This walks you through all settings including Slack credentials, notifications, emoji, layout, and theme. Or edit the config file directly:
 
 ```json
 {
@@ -168,6 +174,11 @@ The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Threa
 | `i` | Enter insert mode (type messages) |
 | `/` | Enter search mode (search channels) |
 | `n` / `N` | Next / previous search match |
+| `r` | Reply to selected message in thread |
+| `e` | Open emoji reaction picker |
+| `o` | Open/view file attachment |
+| `u` | Upload a file |
+| `p` | Toggle presence (active/away) |
 | `q` | Quit |
 | `F1` | Show help |
 
@@ -176,9 +187,13 @@ The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Threa
 | Key | Action |
 |---|---|
 | `Enter` | Send message |
+| `Shift+Enter` | Insert newline |
 | `Escape` | Return to command mode |
 | `Backspace` | Delete character before cursor |
 | `Left` / `Right` | Move cursor |
+| `Tab` / `Shift+Tab` | Indent / dedent (bullet lists) |
+| `Ctrl+b` | Toggle bold |
+| `Ctrl+i` | Toggle italic |
 
 ### Search mode
 
@@ -224,7 +239,7 @@ src/
 │   └── store.rs     # Token storage (Keychain / file)
 ├── slack/
 │   ├── client.rs    # Slack REST API client (reqwest)
-│   └── rtm.rs       # RTM WebSocket (legacy, unused)
+│   └── rtm.rs       # RTM WebSocket for real-time events
 └── tui/
     ├── mod.rs       # App state, event loop, key dispatch
     └── layout.rs    # 3-pane ratatui layout rendering

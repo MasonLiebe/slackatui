@@ -8,6 +8,10 @@ static MENTION_RE: LazyLock<Regex> =
 static EMOJI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r":([\w+\-]+):").unwrap());
 
+/// Matches Slack-formatted links: `<http://url|label>` or `<http://url>` or `<mailto:...>`
+static LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<((?:https?://|mailto:)[^|>]+)(?:\|([^>]+))?>").unwrap());
+
 /// Resolve a single emoji shortcode to its Unicode string.
 /// Returns the Unicode emoji if found, otherwise `:name:`.
 pub fn resolve_emoji(name: &str) -> String {
@@ -32,6 +36,7 @@ pub fn parse_message(
         result = parse_emoji(&result);
     }
 
+    result = parse_links(&result);
     result = parse_mentions(&result, user_cache);
     result = htmlescape::decode_html(&result).unwrap_or(result);
 
@@ -52,6 +57,19 @@ fn parse_mentions(text: &str, user_cache: &HashMap<String, String>) -> String {
                 .unwrap_or_else(|| "unknown".to_string());
 
             format!("@{}", name)
+        })
+        .into_owned()
+}
+
+/// Replace Slack-formatted links with OSC 8 terminal hyperlinks.
+/// `<http://url|label>` → clickable `label`, `<http://url>` → clickable URL.
+fn parse_links(text: &str) -> String {
+    LINK_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            let url = &caps[1];
+            let label = caps.get(2).map(|m| m.as_str()).unwrap_or(url);
+            // OSC 8 terminal hyperlink: \x1b]8;;URL\x1b\\LABEL\x1b]8;;\x1b\\
+            format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, label)
         })
         .into_owned()
 }
@@ -721,6 +739,64 @@ mod tests {
         let cache = HashMap::new();
         let result = parse_message(":thumbsup: hello", false, &cache);
         assert_eq!(result, ":thumbsup: hello");
+    }
+
+    // ---- parse_links ----
+
+    #[test]
+    fn test_parse_link_with_label() {
+        let result = parse_links("<https://example.com|example.com>");
+        assert!(result.contains("example.com"));
+        assert!(result.contains("https://example.com"));
+        // Should contain OSC 8 sequences
+        assert!(result.contains("\x1b]8;;"));
+        assert!(!result.contains('<'));
+    }
+
+    #[test]
+    fn test_parse_link_without_label() {
+        let result = parse_links("<https://example.com/path>");
+        assert!(result.contains("https://example.com/path"));
+        assert!(result.contains("\x1b]8;;"));
+        assert!(!result.contains('<'));
+    }
+
+    #[test]
+    fn test_parse_link_mailto() {
+        let result = parse_links("<mailto:user@example.com|user@example.com>");
+        assert!(result.contains("user@example.com"));
+        assert!(result.contains("\x1b]8;;mailto:user@example.com"));
+    }
+
+    #[test]
+    fn test_parse_link_mixed_with_text() {
+        let result = parse_links("Check out <https://foo.bar|foo.bar> for more");
+        assert!(result.starts_with("Check out "));
+        assert!(result.ends_with(" for more"));
+        assert!(result.contains("\x1b]8;;https://foo.bar"));
+    }
+
+    #[test]
+    fn test_parse_link_multiple() {
+        let result = parse_links("<https://a.com|A> and <https://b.com|B>");
+        assert!(result.contains("\x1b]8;;https://a.com"));
+        assert!(result.contains("\x1b]8;;https://b.com"));
+    }
+
+    #[test]
+    fn test_parse_link_does_not_touch_mentions() {
+        // <@U123> should not be matched by the link regex
+        let result = parse_links("<@U123>");
+        assert_eq!(result, "<@U123>");
+    }
+
+    #[test]
+    fn test_parse_message_with_link() {
+        let cache = HashMap::new();
+        let result = parse_message("visit <https://mgldev.xyz|mgldev.xyz> now", false, &cache);
+        assert!(result.contains("mgldev.xyz"));
+        assert!(!result.contains("<https://"));
+        assert!(result.contains("\x1b]8;;"));
     }
 
     // ---- hash_id ----

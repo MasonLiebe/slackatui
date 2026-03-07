@@ -24,6 +24,7 @@ impl std::fmt::Display for SlackError {
 impl std::error::Error for SlackError {}
 
 /// Low-level Slack API client wrapping reqwest with a token.
+#[derive(Clone)]
 pub struct SlackClient {
     http: Client,
     token: String,
@@ -189,6 +190,36 @@ impl SlackClient {
             .post_json(
                 "users.setPresence",
                 &serde_json::json!({ "presence": presence }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ---- users.profile.get / users.profile.set ----
+
+    /// Get a user's profile (status_text, status_emoji, etc.).
+    pub async fn get_user_profile(&self, user_id: &str) -> Result<UserProfile, SlackError> {
+        let resp: UserProfileResponse = self
+            .get("users.profile.get", &[("user", user_id)])
+            .await?;
+        Ok(resp.profile)
+    }
+
+    /// Set the current user's status text and emoji.
+    pub async fn set_user_status(
+        &self,
+        status_text: &str,
+        status_emoji: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_json(
+                "users.profile.set",
+                &serde_json::json!({
+                    "profile": {
+                        "status_text": status_text,
+                        "status_emoji": status_emoji,
+                    }
+                }),
             )
             .await?;
         Ok(())
@@ -627,6 +658,23 @@ struct PresenceResponse {
     #[allow(dead_code)]
     ok: bool,
     presence: String,
+}
+
+/// Response from users.profile.get.
+#[derive(Debug, Deserialize)]
+struct UserProfileResponse {
+    #[allow(dead_code)]
+    ok: bool,
+    profile: UserProfile,
+}
+
+/// A user's profile data.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserProfile {
+    #[serde(default)]
+    pub status_text: String,
+    #[serde(default)]
+    pub status_emoji: String,
 }
 
 /// Cursor-based pagination metadata from Slack.
