@@ -4,7 +4,7 @@ use chrono::{DateTime, Local, TimeZone};
 
 use crate::parse;
 use crate::slack::{Conversation, SlackClient, SlackMessage};
-use crate::types::{ChannelItem, ChannelType, Message};
+use crate::types::{ChannelItem, ChannelType, ImageFile, Message, Reaction};
 
 /// High-level service that wraps the Slack API client and manages
 /// user/bot caches, channel lists, and message creation.
@@ -170,6 +170,29 @@ impl SlackService {
             msg.thread = sm.thread_ts.clone();
         }
 
+        // Map image files
+        for f in &sm.files {
+            if f.is_image() && !f.url_private.is_empty() {
+                msg.image_files.push(ImageFile {
+                    file_id: f.id.clone(),
+                    title: f.title.clone(),
+                    url: f.url_private.clone(),
+                });
+            }
+        }
+
+        // Map reactions
+        for r in &sm.reactions {
+            let emoji = parse::resolve_emoji(&r.name);
+            let reacted = r.users.contains(&self.current_user_id);
+            msg.reactions.push(Reaction {
+                name: r.name.clone(),
+                emoji,
+                count: r.count,
+                reacted,
+            });
+        }
+
         msg
     }
 
@@ -240,9 +263,9 @@ impl SlackService {
             }
         }
 
-        // Append file references
+        // Append file references (skip images — they're rendered inline)
         for file in &sm.files {
-            if !file.title.is_empty() {
+            if !file.title.is_empty() && !file.is_image() {
                 content.push_str(&format!("\n[file: {}]", file.title));
             }
         }
@@ -563,13 +586,31 @@ mod tests {
             text: "check this".into(),
             files: vec![SlackFile {
                 id: "F1".into(),
-                title: "image.png".into(),
-                url_private: "https://example.com/image.png".into(),
+                title: "report.pdf".into(),
+                mimetype: "application/pdf".into(),
+                url_private: "https://example.com/report.pdf".into(),
             }],
             ..Default::default()
         };
         let content = svc.format_message_content(&sm);
-        assert!(content.contains("[file: image.png]"));
+        assert!(content.contains("[file: report.pdf]"));
+    }
+
+    #[test]
+    fn test_format_image_file_not_shown_as_file() {
+        let svc = make_service();
+        let sm = SlackMessage {
+            text: "check this".into(),
+            files: vec![SlackFile {
+                id: "F1".into(),
+                title: "photo.png".into(),
+                mimetype: "image/png".into(),
+                url_private: "https://example.com/photo.png".into(),
+            }],
+            ..Default::default()
+        };
+        let content = svc.format_message_content(&sm);
+        assert!(!content.contains("[file:"));
     }
 
     // ---- slack_message_to_message ----

@@ -9,6 +9,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::prelude::*;
+use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -50,6 +51,16 @@ pub struct App {
 
     // Current user info (for optimistic updates)
     pub current_user_name: String,
+    pub current_user_id: String,
+
+    // Reaction picker state
+    pub react_query: String,
+    pub react_results: Vec<(String, String)>, // (shortcode, emoji_char)
+    pub react_selected: usize,
+
+    // Image cache: file_id -> rendered pixel rows (each row = Vec of (fg, bg) color pairs)
+    pub image_cache: HashMap<String, Vec<Vec<(Color, Color)>>>,
+    pub image_pending: std::collections::HashSet<String>,
 
     // Status / mode indicator
     pub status: String,
@@ -77,6 +88,12 @@ impl App {
             search_input: String::new(),
             last_search_match: None,
             current_user_name: String::new(),
+            current_user_id: String::new(),
+            react_query: String::new(),
+            react_results: Vec::new(),
+            react_selected: 0,
+            image_cache: HashMap::new(),
+            image_pending: std::collections::HashSet::new(),
             status: String::new(),
         }
     }
@@ -92,6 +109,7 @@ impl App {
             Mode::Command => "command",
             Mode::Insert => "insert",
             Mode::Search => "search",
+            Mode::React => return None, // React mode handles keys inline
         };
         self.config.key_map.get(mode_key)
     }
@@ -298,6 +316,7 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     svc.init().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
     let mut app = App::new(config);
+    app.current_user_id = svc.current_user_id.clone();
     app.current_user_name = svc
         .user_cache
         .get(&svc.current_user_id)
@@ -328,13 +347,16 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     // Create a channel for async actions triggered by key events
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AsyncAction>();
 
+    // Queue image downloads for initial messages
+    let initial_msgs = app.messages.clone();
+    queue_image_downloads(&mut app, &initial_msgs, &action_tx);
+
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     // Enable keyboard enhancement for Shift+Enter etc. (ignored if unsupported)
     let _ = stdout().execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
     ));
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -364,8 +386,8 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
 async fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     // Total characters to animate (logo + welcome message)
     // We'll reveal ~4 chars per frame at 30ms intervals for a snappy typewriter
-    let total_frames = 120; // enough to cover logo + message + hint
-    let chars_per_frame = 3;
+    let total_frames = 80; // enough to cover logo + message + hint
+    let chars_per_frame = 5;
 
     for frame_idx in 0..=total_frames {
         let char_count = frame_idx * chars_per_frame;
@@ -374,7 +396,7 @@ async fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> i
         })?;
 
         // Check if user pressed a key to skip
-        if event::poll(Duration::from_millis(25))? {
+        if event::poll(Duration::from_millis(18))? {
             if let Event::Key(_) = event::read()? {
                 // Draw the fully revealed splash once, then break
                 terminal.draw(|f| {
@@ -407,6 +429,10 @@ enum AsyncAction {
     SendMessage { text: String, thread_ts: Option<String> },
     SelectChannel { index: usize },
     OpenThread { channel_id: String, thread_ts: String },
+    ToggleReaction { channel_id: String, timestamp: String, emoji_name: String, msg_idx: usize },
+    DownloadImage { file_id: String, url: String },
+    ImageReady { file_id: String, rows: Vec<Vec<(Color, Color)>> },
+    ImageFailed { file_id: String },
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -440,12 +466,12 @@ async fn async_main_loop(
 
             // Poll for new messages periodically
             _ = poll_timer.tick() => {
-                poll_new_messages(app, svc).await;
+                poll_new_messages(app, svc, action_tx).await;
             }
 
             // Async actions from key handlers
             Some(action) = action_rx.recv() => {
-                handle_async_action(app, svc, action).await;
+                handle_async_action(app, svc, action, action_tx).await;
             }
         }
     }
@@ -454,7 +480,11 @@ async fn async_main_loop(
 }
 
 /// Poll the active channel for new messages since the last known message.
-async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
+async fn poll_new_messages(
+    app: &mut App,
+    svc: &mut SlackService,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
     let (ch_id, oldest_ts) = match app.current_channel() {
         Some(ch) => {
             // Use the last real (non-optimistic) message timestamp
@@ -478,6 +508,7 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
         Ok(new_msgs) if !new_msgs.is_empty() => {
             // Remove optimistic messages — real ones are arriving
             app.messages.retain(|m| !m.timestamp.starts_with("optimistic_"));
+            queue_image_downloads(app, &new_msgs, action_tx);
             app.messages.extend(new_msgs);
             app.chat_scroll = 0; // Scroll to bottom on new messages
         }
@@ -489,13 +520,43 @@ async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
 }
 
 /// Handle async actions triggered by key events.
-async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: AsyncAction) {
+/// Queue image downloads for any image files in the given messages that aren't already cached/pending.
+fn queue_image_downloads(
+    app: &mut App,
+    messages: &[Message],
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
+    for msg in messages {
+        for img in &msg.image_files {
+            if !app.image_cache.contains_key(&img.file_id) && !app.image_pending.contains(&img.file_id) {
+                app.image_pending.insert(img.file_id.clone());
+                let _ = action_tx.send(AsyncAction::DownloadImage {
+                    file_id: img.file_id.clone(),
+                    url: img.url.clone(),
+                });
+            }
+        }
+    }
+}
+
+async fn handle_async_action(
+    app: &mut App,
+    svc: &mut SlackService,
+    action: AsyncAction,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
     match action {
         AsyncAction::SendMessage { text, thread_ts } => {
             if let Some(ch) = app.current_channel() {
                 let ch_id = ch.id.clone();
                 if let Err(e) = svc.send(&ch_id, &text, thread_ts.as_deref()).await {
                     app.status = format!("Send error: {}", e);
+                } else if let Some(ts) = &thread_ts {
+                    // Refresh thread to replace optimistic message with real data
+                    if let Ok(msgs) = svc.get_thread_messages(&ch_id, ts).await {
+                        app.thread_messages = msgs;
+                        app.thread_scroll = 0;
+                    }
                 }
             }
         }
@@ -512,7 +573,11 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 app.channels[index].notification = false;
 
                 match svc.get_messages(&ch_id, 50).await {
-                    Ok(msgs) => app.messages = msgs,
+                    Ok(msgs) => {
+                        app.messages = msgs;
+                        let msgs_ref = app.messages.clone();
+                        queue_image_downloads(app, &msgs_ref, action_tx);
+                    }
                     Err(e) => app.status = format!("Error: {}", e),
                 }
             }
@@ -526,6 +591,118 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
                 Err(e) => app.status = format!("Thread error: {}", e),
             }
+        }
+        AsyncAction::ToggleReaction { channel_id, timestamp, emoji_name, msg_idx } => {
+            // Check if we already reacted — toggle
+            let already_reacted = app.messages
+                .get(msg_idx)
+                .map(|m| m.reactions.iter().any(|r| r.name == emoji_name && r.reacted))
+                .unwrap_or(false);
+
+            let result = if already_reacted {
+                svc.client.remove_reaction(&channel_id, &timestamp, &emoji_name).await
+            } else {
+                svc.client.add_reaction(&channel_id, &timestamp, &emoji_name).await
+            };
+
+            match result {
+                Ok(()) => {
+                    // Optimistic update
+                    if let Some(msg) = app.messages.get_mut(msg_idx) {
+                        if already_reacted {
+                            // Decrement or remove
+                            if let Some(r) = msg.reactions.iter_mut().find(|r| r.name == emoji_name) {
+                                r.count = r.count.saturating_sub(1);
+                                r.reacted = false;
+                                if r.count == 0 {
+                                    msg.reactions.retain(|r| r.name != emoji_name);
+                                }
+                            }
+                        } else {
+                            // Increment or add
+                            if let Some(r) = msg.reactions.iter_mut().find(|r| r.name == emoji_name) {
+                                r.count += 1;
+                                r.reacted = true;
+                            } else {
+                                let emoji = crate::parse::resolve_emoji(&emoji_name);
+                                msg.reactions.push(crate::types::Reaction {
+                                    name: emoji_name,
+                                    emoji,
+                                    count: 1,
+                                    reacted: true,
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.status = format!("Reaction error: {}", e);
+                }
+            }
+        }
+        AsyncAction::DownloadImage { file_id, url } => {
+            // Spawn as background task to avoid blocking the UI
+            let token = svc.client.token().to_string();
+            let fid = file_id.clone();
+            let tx = action_tx.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let result = client
+                    .get(&url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .and_then(|r| Ok(r));
+                match result {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(bytes) = resp.bytes().await {
+                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                let max_width: u32 = 60;
+                                let max_height: u32 = 30;
+                                let img = img.thumbnail(max_width, max_height * 2);
+                                let rgba = img.to_rgba8();
+                                let (w, h) = rgba.dimensions();
+
+                                let mut rows: Vec<Vec<(Color, Color)>> = Vec::new();
+                                let mut y = 0u32;
+                                while y < h {
+                                    let mut row = Vec::new();
+                                    for x in 0..w {
+                                        let top = rgba.get_pixel(x, y);
+                                        let bottom = if y + 1 < h {
+                                            rgba.get_pixel(x, y + 1)
+                                        } else {
+                                            top
+                                        };
+                                        let fg = Color::Rgb(top[0], top[1], top[2]);
+                                        let bg = Color::Rgb(bottom[0], bottom[1], bottom[2]);
+                                        row.push((fg, bg));
+                                    }
+                                    rows.push(row);
+                                    y += 2;
+                                }
+
+                                let _ = tx.send(AsyncAction::ImageReady {
+                                    file_id: fid,
+                                    rows,
+                                });
+                                return;
+                            }
+                        }
+                        let _ = tx.send(AsyncAction::ImageFailed { file_id: fid });
+                    }
+                    _ => {
+                        let _ = tx.send(AsyncAction::ImageFailed { file_id: fid });
+                    }
+                }
+            });
+        }
+        AsyncAction::ImageReady { file_id, rows } => {
+            app.image_cache.insert(file_id.clone(), rows);
+            app.image_pending.remove(&file_id);
+        }
+        AsyncAction::ImageFailed { file_id } => {
+            app.image_pending.remove(&file_id);
         }
     }
 }
@@ -548,7 +725,12 @@ fn handle_key_async(
                 }
             }
             if let KeyCode::Char(c) = code {
-                app.input_char(c);
+                let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                app.input_char(ch);
             }
         }
         Mode::Search => {
@@ -559,7 +741,69 @@ fn handle_key_async(
                 }
             }
             if let KeyCode::Char(c) = code {
-                app.search_input.push(c);
+                let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                app.search_input.push(ch);
+            }
+        }
+        Mode::React => {
+            match code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Command;
+                    app.react_query.clear();
+                    app.react_results.clear();
+                    app.status.clear();
+                }
+                KeyCode::Enter => {
+                    // Select the highlighted emoji and send reaction
+                    if let Some((shortcode, _)) = app.react_results.get(app.react_selected).cloned() {
+                        if let Some(msg_idx) = app.selected_message {
+                            if let Some(msg) = app.messages.get(msg_idx) {
+                                let ch_id = app.current_channel()
+                                    .map(|c| c.id.clone())
+                                    .unwrap_or_default();
+                                let ts = msg.timestamp.clone();
+                                let _ = action_tx.send(AsyncAction::ToggleReaction {
+                                    channel_id: ch_id,
+                                    timestamp: ts,
+                                    emoji_name: shortcode,
+                                    msg_idx,
+                                });
+                            }
+                        }
+                    }
+                    app.mode = Mode::Command;
+                    app.react_query.clear();
+                    app.react_results.clear();
+                    app.status.clear();
+                }
+                KeyCode::Backspace => {
+                    app.react_query.pop();
+                    app.react_selected = 0;
+                    update_react_results(app);
+                }
+                KeyCode::Up => {
+                    app.react_selected = app.react_selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if !app.react_results.is_empty() {
+                        app.react_selected = (app.react_selected + 1).min(app.react_results.len() - 1);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    app.react_query.push(ch);
+                    app.react_selected = 0;
+                    update_react_results(app);
+                }
+                _ => {}
             }
         }
         Mode::Command => {
@@ -615,6 +859,18 @@ fn dispatch_action(
             app.search_input.clear();
             app.status = "/".to_string();
         }
+        "mode-react" => {
+            if app.selected_message.is_some() {
+                app.mode = Mode::React;
+                app.react_query.clear();
+                app.react_selected = 0;
+                // Show popular emojis by default
+                app.react_results = POPULAR_EMOJIS.iter()
+                    .map(|&(name, emoji)| (name.to_string(), emoji.to_string()))
+                    .collect();
+                app.status = "React: type to search emoji".to_string();
+            }
+        }
 
         // Focus-aware up/down navigation
         "channel-up" => match app.focus {
@@ -627,7 +883,10 @@ fn dispatch_action(
                     });
                 }
             }
-            Focus::Chat => app.message_up(),
+            Focus::Chat => {
+                app.message_up();
+                hide_thread_if_no_replies(app);
+            }
             Focus::Thread => app.thread_up(),
         },
         "channel-down" => match app.focus {
@@ -640,7 +899,10 @@ fn dispatch_action(
                     });
                 }
             }
-            Focus::Chat => app.message_down(),
+            Focus::Chat => {
+                app.message_down();
+                hide_thread_if_no_replies(app);
+            }
             Focus::Thread => app.thread_down(),
         },
         "channel-top" => match app.focus {
@@ -653,7 +915,10 @@ fn dispatch_action(
                     });
                 }
             }
-            Focus::Chat => app.message_top(),
+            Focus::Chat => {
+                app.message_top();
+                hide_thread_if_no_replies(app);
+            }
             Focus::Thread => {}
         },
         "channel-bottom" => match app.focus {
@@ -666,7 +931,10 @@ fn dispatch_action(
                     });
                 }
             }
-            Focus::Chat => app.message_bottom(),
+            Focus::Chat => {
+                app.message_bottom();
+                hide_thread_if_no_replies(app);
+            }
             Focus::Thread => {}
         },
 
@@ -790,14 +1058,28 @@ fn dispatch_action(
                     text.clone(),
                     chrono::Local::now(),
                 );
-                if thread_ts.is_none() {
+                if let Some(ref ts) = thread_ts {
+                    // Thread reply: add to thread pane and bump parent reply count
+                    app.thread_messages.push(optimistic);
+                    app.thread_scroll = 0;
+                    for msg in &mut app.messages {
+                        if msg.timestamp == *ts || msg.thread == *ts {
+                            msg.reply_count += 1;
+                            break;
+                        }
+                    }
+                } else {
                     app.messages.push(optimistic);
                 }
-                let _ = action_tx.send(AsyncAction::SendMessage { text, thread_ts });
+                let _ = action_tx.send(AsyncAction::SendMessage { text, thread_ts: thread_ts.clone() });
             }
             app.mode = Mode::Command;
-            app.chat_scroll = 0;
-            app.selected_message = None;
+            if thread_ts.is_none() {
+                // Regular message: scroll to bottom, deselect
+                app.chat_scroll = 0;
+                app.selected_message = None;
+            }
+            // Thread reply: keep selected_message so focus stays on parent
             app.status.clear();
         }
 
@@ -883,7 +1165,101 @@ fn insert_wrap_markers(app: &mut App, marker: char) {
     // Cursor stays between the two markers
 }
 
+/// Hide the thread pane if the currently selected message has no replies.
+fn hide_thread_if_no_replies(app: &mut App) {
+    if !app.thread_visible {
+        return;
+    }
+    let has_thread = app
+        .selected_message
+        .and_then(|idx| app.messages.get(idx))
+        .map(|msg| msg.reply_count > 0 || !msg.thread.is_empty())
+        .unwrap_or(false);
+    if !has_thread {
+        app.thread_visible = false;
+        app.thread_messages.clear();
+        if app.focus == Focus::Thread {
+            app.focus = Focus::Chat;
+        }
+    }
+}
+
 /// Try to open the thread for the currently selected message.
+/// Popular emojis shown as defaults in the reaction picker.
+const POPULAR_EMOJIS: &[(&str, &str)] = &[
+    ("thumbsup", "\u{1F44D}"),
+    ("thumbsdown", "\u{1F44E}"),
+    ("heart", "\u{2764}\u{FE0F}"),
+    ("smile", "\u{1F604}"),
+    ("joy", "\u{1F602}"),
+    ("fire", "\u{1F525}"),
+    ("tada", "\u{1F389}"),
+    ("eyes", "\u{1F440}"),
+    ("rocket", "\u{1F680}"),
+    ("pray", "\u{1F64F}"),
+    ("100", "\u{1F4AF}"),
+    ("white_check_mark", "\u{2705}"),
+    ("wave", "\u{1F44B}"),
+    ("clap", "\u{1F44F}"),
+    ("raised_hands", "\u{1F64C}"),
+    ("thinking_face", "\u{1F914}"),
+    ("muscle", "\u{1F4AA}"),
+    ("sparkles", "\u{2728}"),
+    ("star", "\u{2B50}"),
+    ("warning", "\u{26A0}\u{FE0F}"),
+    ("ok_hand", "\u{1F44C}"),
+    ("brain", "\u{1F9E0}"),
+    ("skull", "\u{1F480}"),
+    ("sunglasses", "\u{1F60E}"),
+    ("beer", "\u{1F37A}"),
+    ("coffee", "\u{2615}"),
+    ("heavy_check_mark", "\u{2714}\u{FE0F}"),
+    ("x", "\u{274C}"),
+    ("point_up", "\u{261D}\u{FE0F}"),
+    ("+1", "\u{1F44D}"),
+];
+
+/// Search the emoji alias table + emojis crate for matches.
+fn update_react_results(app: &mut App) {
+    if app.react_query.is_empty() {
+        app.react_results = POPULAR_EMOJIS.iter()
+            .map(|&(name, emoji)| (name.to_string(), emoji.to_string()))
+            .collect();
+        return;
+    }
+
+    let query = app.react_query.to_lowercase();
+    let mut results: Vec<(String, String)> = Vec::new();
+
+    // Search popular emojis first
+    for &(name, emoji) in POPULAR_EMOJIS {
+        if name.contains(&query) {
+            results.push((name.to_string(), emoji.to_string()));
+        }
+    }
+
+    // Search the full alias table
+    let aliases = &*crate::parse::SLACK_EMOJI_ALIASES;
+    for (&name, &emoji) in aliases.iter() {
+        if name.contains(&query) && !results.iter().any(|(n, _)| n == name) {
+            results.push((name.to_string(), emoji.to_string()));
+        }
+    }
+
+    // Also search the emojis crate
+    for emoji in emojis::iter() {
+        if let Some(shortcode) = emoji.shortcode() {
+            if shortcode.contains(&query) && !results.iter().any(|(n, _)| n == shortcode) {
+                results.push((shortcode.to_string(), emoji.as_str().to_string()));
+            }
+        }
+    }
+
+    // Limit results
+    results.truncate(20);
+    app.react_results = results;
+}
+
 fn try_open_thread(app: &mut App, action_tx: &mpsc::UnboundedSender<AsyncAction>) {
     let Some(idx) = app.selected_message else {
         return;
@@ -925,6 +1301,9 @@ fn key_to_string(code: KeyCode, modifiers: KeyModifiers) -> String {
         KeyCode::Char(c) => {
             if ctrl || sup {
                 format!("C-{}", c)
+            } else if shift && c.is_ascii_lowercase() {
+                // Keyboard enhancement reports Shift+a as Char('a') + SHIFT
+                c.to_ascii_uppercase().to_string()
             } else {
                 c.to_string()
             }

@@ -1,5 +1,7 @@
+use chrono::Datelike;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
+use std::collections::HashMap;
 
 use super::App;
 use crate::parse;
@@ -167,6 +169,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     render_status(frame, app, status_area);
+
+    // Reaction picker overlay
+    if app.mode == Mode::React {
+        render_react_picker(frame, app, size);
+    }
 }
 
 /// Render the channel sidebar.
@@ -267,28 +274,71 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Build display lines for a single message, splitting on newlines.
-/// First line gets timestamp + name, continuation lines get indented.
-fn build_message_lines<'a>(msg: &'a crate::types::Message, is_selected: bool) -> Vec<Line<'a>> {
-    let time_str = msg.time.format("%H:%M").to_string();
-    let header_width = time_str.len() + 2 + msg.name.len() + 2; // " HH:MM name: "
-    let indent: String = " ".repeat(header_width);
+/// Determine if two consecutive messages should be grouped (same author, within 5 minutes).
+fn should_group(prev: &crate::types::Message, curr: &crate::types::Message) -> bool {
+    prev.name == curr.name
+        && prev.time.date_naive() == curr.time.date_naive()
+        && (curr.time - prev.time).num_minutes().abs() < 5
+}
 
-    let reply_indicator = if msg.reply_count > 0 {
-        format!(" [{} replies]", msg.reply_count)
-    } else if !msg.thread.is_empty() {
-        " [thread]".to_string()
-    } else {
-        String::new()
+/// Build a centered date separator line like "── Thursday, March 5th ──".
+fn date_separator(date: chrono::NaiveDate) -> Line<'static> {
+    let formatted = date.format("%A, %B %-d").to_string();
+    // Add ordinal suffix
+    let day = date.day();
+    let suffix = match day {
+        1 | 21 | 31 => "st",
+        2 | 22 => "nd",
+        3 | 23 => "rd",
+        _ => "th",
     };
+    let label = format!(" {}{} ", formatted, suffix);
+    Line::from(vec![
+        Span::styled("────", Style::default().fg(Color::Rgb(60, 60, 80))),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Rgb(160, 160, 180))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("────", Style::default().fg(Color::Rgb(60, 60, 80))),
+    ])
+    .alignment(Alignment::Center)
+}
 
+/// Convert cached image pixel rows to Lines for rendering using half-block characters.
+fn image_to_lines(rows: &[Vec<(Color, Color)>], sel_bg: Option<Color>) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::raw("  ")); // indent
+            for &(fg, bg) in row {
+                let style = Style::default().fg(fg).bg(bg);
+                spans.push(Span::styled("\u{2580}", style)); // ▀
+            }
+            if let Some(bg) = sel_bg {
+                // Extend selection background to rest of line
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Build display lines for a message with Slack-style layout.
+/// `show_header` controls whether the author name + time are shown (false for grouped messages).
+fn build_message_lines<'a>(
+    msg: &'a crate::types::Message,
+    is_selected: bool,
+    show_header: bool,
+    image_cache: &HashMap<String, Vec<Vec<(Color, Color)>>>,
+) -> Vec<Line<'a>> {
     let sel_bg = if is_selected {
         Some(Color::Rgb(50, 50, 70))
     } else {
         None
     };
 
-    // Helper to optionally add selection background
     let style_with_bg = |s: Style| -> Style {
         if let Some(bg) = sel_bg {
             s.bg(bg)
@@ -297,39 +347,34 @@ fn build_message_lines<'a>(msg: &'a crate::types::Message, is_selected: bool) ->
         }
     };
 
-    let content_lines: Vec<&str> = msg.content.split('\n').collect();
     let mut result = Vec::new();
 
-    for (line_idx, content_line) in content_lines.iter().enumerate() {
-        let mut spans: Vec<Span> = Vec::new();
-
-        if line_idx == 0 {
-            // First line: timestamp + name + content
-            spans.push(Span::styled(
-                format!(" {} ", time_str),
-                style_with_bg(Style::default().fg(Color::Rgb(100, 100, 120))),
-            ));
-            spans.push(Span::styled(
+    if show_header {
+        // Header line: "  Name  10:30 AM"
+        let time_str = msg.time.format("%-I:%M %p").to_string();
+        result.push(Line::from(vec![
+            Span::styled("  ", style_with_bg(Style::default())),
+            Span::styled(
                 msg.name.clone(),
                 style_with_bg(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(Color::Rgb(220, 220, 240))
                         .add_modifier(Modifier::BOLD),
                 ),
-            ));
-            spans.push(Span::styled(
-                ": ",
+            ),
+            Span::styled(
+                format!("  {}", time_str),
                 style_with_bg(Style::default().fg(Color::Rgb(100, 100, 120))),
-            ));
-        } else {
-            // Continuation lines: indent to align with content
-            spans.push(Span::styled(
-                indent.clone(),
-                style_with_bg(Style::default()),
-            ));
-        }
+            ),
+        ]));
+    }
 
-        // Add styled content for this line
+    // Content lines, indented
+    let content_lines: Vec<&str> = msg.content.split('\n').collect();
+    for (line_idx, content_line) in content_lines.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled("  ", style_with_bg(Style::default())));
+
         for seg_span in content_spans(content_line) {
             spans.push(Span::styled(
                 seg_span.content,
@@ -338,25 +383,76 @@ fn build_message_lines<'a>(msg: &'a crate::types::Message, is_selected: bool) ->
         }
 
         // Reply indicator on the last content line
-        if line_idx == content_lines.len() - 1 && !reply_indicator.is_empty() {
-            spans.push(Span::styled(
-                reply_indicator.clone(),
-                style_with_bg(
-                    Style::default()
-                        .fg(Color::Rgb(180, 140, 60))
-                        .add_modifier(Modifier::DIM),
-                ),
-            ));
+        if line_idx == content_lines.len() - 1 {
+            if msg.reply_count > 0 {
+                let reply_text = if msg.reply_count == 1 {
+                    " ↳ 1 reply".to_string()
+                } else {
+                    format!(" ↳ {} replies", msg.reply_count)
+                };
+                spans.push(Span::styled(
+                    reply_text,
+                    style_with_bg(
+                        Style::default()
+                            .fg(Color::Rgb(80, 160, 220))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ));
+            } else if !msg.thread.is_empty() {
+                spans.push(Span::styled(
+                    " ↳ thread",
+                    style_with_bg(Style::default().fg(Color::Rgb(100, 100, 130))),
+                ));
+            }
         }
 
         result.push(Line::from(spans));
+    }
+
+    // Image files
+    for img in &msg.image_files {
+        if let Some(rows) = image_cache.get(&img.file_id) {
+            result.extend(image_to_lines(rows, sel_bg));
+        } else {
+            // Show placeholder while loading
+            result.push(Line::from(vec![
+                Span::styled("  ", style_with_bg(Style::default())),
+                Span::styled(
+                    format!("[loading image: {}]", img.title),
+                    style_with_bg(Style::default().fg(Color::Rgb(100, 100, 130))),
+                ),
+            ]));
+        }
+    }
+
+    // Reactions line
+    if !msg.reactions.is_empty() {
+        let mut reaction_spans: Vec<Span> = Vec::new();
+        reaction_spans.push(Span::styled("  ", style_with_bg(Style::default())));
+        for (i, reaction) in msg.reactions.iter().enumerate() {
+            if i > 0 {
+                reaction_spans.push(Span::styled(" ", style_with_bg(Style::default())));
+            }
+            let label = format!(" {} {} ", reaction.emoji, reaction.count);
+            let style = if reaction.reacted {
+                Style::default()
+                    .fg(Color::Rgb(80, 160, 220))
+                    .bg(Color::Rgb(30, 50, 70))
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(160, 160, 180))
+                    .bg(Color::Rgb(45, 45, 60))
+            };
+            reaction_spans.push(Span::styled(label, style_with_bg(style)));
+        }
+        result.push(Line::from(reaction_spans));
     }
 
     result
 }
 
 /// Render chat messages with text wrapping, scroll-to-bottom, selection highlighting,
-/// and thread reply count indicators.
+/// Slack-style grouping, and date separators.
 fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width as usize;
     let height = area.height as usize;
@@ -368,11 +464,36 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
     // msg_line_ranges[i] = (start_line, end_line) in the flat lines vec.
     let mut all_lines: Vec<Line> = Vec::new();
     let mut msg_line_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut last_date: Option<chrono::NaiveDate> = None;
 
     for (i, msg) in app.messages.iter().enumerate() {
         let is_selected = app.selected_message == Some(i);
+
+        // Date separator if the day changed
+        let msg_date = msg.time.date_naive();
+        if last_date != Some(msg_date) {
+            if last_date.is_some() {
+                all_lines.push(Line::default()); // spacing before separator
+            }
+            all_lines.push(date_separator(msg_date));
+            all_lines.push(Line::default()); // spacing after separator
+            last_date = Some(msg_date);
+        }
+
+        // Determine if this message should be grouped with the previous one
+        let grouped = if i > 0 {
+            should_group(&app.messages[i - 1], msg)
+        } else {
+            false
+        };
+
+        // Add a blank line before new message groups (not between grouped messages)
+        if !grouped && i > 0 {
+            all_lines.push(Line::default());
+        }
+
         let start = all_lines.len();
-        all_lines.extend(build_message_lines(msg, is_selected));
+        all_lines.extend(build_message_lines(msg, is_selected, !grouped, &app.image_cache));
         msg_line_ranges.push((start, all_lines.len()));
     }
 
@@ -510,8 +631,16 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    for msg in &app.thread_messages {
-        lines.extend(build_message_lines(msg, false));
+    for (i, msg) in app.thread_messages.iter().enumerate() {
+        let grouped = if i > 0 {
+            should_group(&app.thread_messages[i - 1], msg)
+        } else {
+            false
+        };
+        if !grouped && i > 0 {
+            lines.push(Line::default());
+        }
+        lines.extend(build_message_lines(msg, false, !grouped, &app.image_cache));
     }
 
     let paragraph = Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
@@ -555,6 +684,19 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             }
             Line::from(spans)
         }
+        Mode::React => Line::from(vec![
+            Span::styled(
+                " REACT ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(220, 180, 50))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " type to search, Enter to select, Esc to cancel",
+                Style::default().fg(Color::Rgb(100, 100, 120)),
+            ),
+        ]),
         Mode::Search => Line::from(vec![
             Span::styled(
                 " SEARCH ",
@@ -608,6 +750,75 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let bar = Paragraph::new(content)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)).fg(Color::White));
     frame.render_widget(bar, area);
+}
+
+/// Render the emoji reaction picker as a centered popup.
+fn render_react_picker(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" React ")
+        .title_style(
+            Style::default()
+                .fg(Color::Rgb(220, 180, 50))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(220, 180, 50)))
+        .border_type(BorderType::Rounded);
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner.height < 2 || inner.width < 5 {
+        return;
+    }
+
+    // Search input line
+    let search_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    let results_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+
+    let search_line = Line::from(vec![
+        Span::styled(" /", Style::default().fg(Color::Rgb(220, 180, 50))),
+        Span::raw(&app.react_query),
+        Span::styled("\u{258e}", Style::default().fg(Color::Rgb(220, 180, 50))),
+    ]);
+    frame.render_widget(Paragraph::new(search_line), search_area);
+
+    // Emoji results
+    let max_visible = results_area.height as usize;
+    let scroll = if app.react_selected >= max_visible {
+        app.react_selected - max_visible + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (name, emoji)) in app.react_results.iter().enumerate().skip(scroll).take(max_visible) {
+        let is_sel = i == app.react_selected;
+        let style = if is_sel {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(60, 60, 90))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(180, 180, 200))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {}  ", emoji), style),
+            Span::styled(format!(":{}: ", name), style),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), results_area);
 }
 
 #[cfg(test)]

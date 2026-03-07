@@ -394,6 +394,70 @@ impl SlackClient {
         Ok(())
     }
 
+    // ---- reactions.add / reactions.remove ----
+
+    /// Add a reaction to a message.
+    pub async fn add_reaction(
+        &self,
+        channel_id: &str,
+        timestamp: &str,
+        emoji_name: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_json(
+                "reactions.add",
+                &serde_json::json!({
+                    "channel": channel_id,
+                    "timestamp": timestamp,
+                    "name": emoji_name,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        timestamp: &str,
+        emoji_name: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_json(
+                "reactions.remove",
+                &serde_json::json!({
+                    "channel": channel_id,
+                    "timestamp": timestamp,
+                    "name": emoji_name,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ---- file download ----
+
+    /// Download a file from Slack (requires auth for url_private URLs).
+    pub async fn download_file(&self, url: &str) -> Result<Vec<u8>, SlackError> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| SlackError::Http(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(SlackError::Http(format!("HTTP {}", resp.status())));
+        }
+
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| SlackError::Http(e.to_string()))
+    }
+
     // ---- rtm.connect ----
 
     /// Get the WebSocket URL for an RTM connection.
@@ -587,6 +651,18 @@ pub struct SlackMessage {
     pub attachments: Vec<SlackAttachment>,
     #[serde(default)]
     pub files: Vec<SlackFile>,
+    #[serde(default)]
+    pub reactions: Vec<SlackReaction>,
+}
+
+/// A reaction on a Slack message.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SlackReaction {
+    pub name: String,
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 /// A Slack message attachment.
@@ -619,7 +695,25 @@ pub struct SlackFile {
     #[serde(default)]
     pub title: String,
     #[serde(default)]
+    pub mimetype: String,
+    #[serde(default)]
     pub url_private: String,
+}
+
+impl SlackFile {
+    /// Check if this file is an image based on mimetype or file extension.
+    pub fn is_image(&self) -> bool {
+        if self.mimetype.starts_with("image/") {
+            return true;
+        }
+        let lower = self.title.to_lowercase();
+        lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".gif")
+            || lower.ends_with(".webp")
+            || lower.ends_with(".bmp")
+    }
 }
 
 #[cfg(test)]

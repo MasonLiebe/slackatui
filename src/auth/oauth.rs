@@ -29,6 +29,8 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "chat:write",
     "users:read",
     "users:write",
+    "reactions:read",
+    "reactions:write",
 ];
 
 /// Configuration for the OAuth v2 flow.
