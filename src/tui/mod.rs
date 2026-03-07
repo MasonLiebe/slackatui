@@ -153,6 +153,9 @@ impl App {
             }
         } else {
             self.chat_scroll = self.chat_scroll.saturating_add(10);
+            // Clamp: rough upper bound is total message count * ~3 lines each
+            let max_scroll = self.messages.len().saturating_mul(3);
+            self.chat_scroll = self.chat_scroll.min(max_scroll);
         }
     }
 
@@ -171,6 +174,8 @@ impl App {
     /// Scroll thread up.
     pub fn thread_up(&mut self) {
         self.thread_scroll = self.thread_scroll.saturating_add(5);
+        let max_scroll = self.thread_messages.len().saturating_mul(3);
+        self.thread_scroll = self.thread_scroll.min(max_scroll);
     }
 
     /// Scroll thread down.
@@ -904,6 +909,15 @@ mod tests {
     #[test]
     fn test_chat_scroll() {
         let mut app = test_app();
+        // Add enough messages so scroll has room
+        for i in 0..20 {
+            app.messages.push(crate::types::Message::new(
+                format!("{}.0", i),
+                "user".into(),
+                "msg".into(),
+                chrono::Local::now(),
+            ));
+        }
         app.chat_up();
         assert_eq!(app.chat_scroll, 10);
         app.chat_up();
@@ -918,8 +932,35 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_scroll_clamped() {
+        let mut app = test_app();
+        // With only 2 messages, max scroll = 2*3 = 6
+        for i in 0..2 {
+            app.messages.push(crate::types::Message::new(
+                format!("{}.0", i),
+                "user".into(),
+                "msg".into(),
+                chrono::Local::now(),
+            ));
+        }
+        app.chat_up();
+        assert_eq!(app.chat_scroll, 6); // clamped to 2*3
+        app.chat_up();
+        assert_eq!(app.chat_scroll, 6); // stays clamped
+    }
+
+    #[test]
     fn test_thread_scroll() {
         let mut app = test_app();
+        // Add enough thread messages so scroll has room
+        for i in 0..10 {
+            app.thread_messages.push(crate::types::Message::new(
+                format!("{}.0", i),
+                "user".into(),
+                "msg".into(),
+                chrono::Local::now(),
+            ));
+        }
         app.thread_up();
         assert_eq!(app.thread_scroll, 5);
         app.thread_down();

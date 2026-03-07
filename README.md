@@ -8,9 +8,11 @@ A Slack client for your terminal, built with Rust and [ratatui](https://ratatui.
 ## Features
 
 - Browse channels, groups, DMs, and multi-party DMs
-- Send and receive messages in real time (via Slack RTM)
-- Threaded conversations
+- Send and receive messages with polling-based updates
+- Threaded conversations with reply count indicators
 - Vim-style keybindings (command / insert / search modes)
+- Focus-based pane navigation (channels -> chat -> thread)
+- Message selection and highlighting
 - Emoji shortcode rendering (`:thumbsup:` -> 👍)
 - Mention expansion (`<@U12345>` -> `@username`)
 - Channel search with `/` then `n`/`N` to cycle matches
@@ -137,21 +139,36 @@ slackatui
 
 ## Keybindings
 
+The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Thread** (replies). You navigate between panes with `l` (right) and `h` (left). The active pane is highlighted with a green border.
+
 ### Command mode (default)
+
+**Pane navigation:**
+
+| Key | Action |
+|---|---|
+| `l` or `Enter` | Move focus right (Channels -> Chat -> open thread) |
+| `h` | Move focus left (Thread -> Chat -> Channels) |
+| `'` | Open thread for selected message |
+
+**Within the focused pane:**
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate down / up (channels, messages, or thread depending on focus) |
+| `g` / `G` | Jump to first / last item |
+| `Ctrl-f` / `Ctrl-b` | Page scroll down / up |
+| `Ctrl-d` / `Ctrl-u` | Page scroll down / up |
+| `PgDn` / `PgUp` | Page scroll down / up |
+
+**Other:**
 
 | Key | Action |
 |---|---|
 | `i` | Enter insert mode (type messages) |
 | `/` | Enter search mode (search channels) |
-| `q` | Quit |
-| `j` / `k` | Navigate channels down / up |
-| `g` / `G` | Jump to first / last channel |
-| `J` / `K` | Scroll thread down / up |
-| `Ctrl-f` / `Ctrl-b` | Scroll chat down / up |
-| `Ctrl-d` / `Ctrl-u` | Scroll chat down / up |
-| `PgDn` / `PgUp` | Scroll chat down / up |
 | `n` / `N` | Next / previous search match |
-| `'` | Toggle thread panel |
+| `q` | Quit |
 | `F1` | Show help |
 
 ### Insert mode
@@ -170,6 +187,14 @@ slackatui
 | Type | Filter channels by name |
 | `Enter` | Jump to match and exit search |
 | `Escape` | Cancel search |
+
+### Workflow example
+
+1. Start in **Channels** pane — use `j`/`k` to pick a channel
+2. Press `l` or `Enter` to move into **Chat** — messages are highlighted as you navigate with `j`/`k`
+3. On a message with replies, press `l`, `Enter`, or `'` to open the **Thread** pane
+4. Press `h` to go back (Thread -> Chat -> Channels)
+5. Press `i` to type a message, `Enter` to send, `Escape` to return to command mode
 
 ## Troubleshooting
 
@@ -199,7 +224,7 @@ src/
 │   └── store.rs     # Token storage (Keychain / file)
 ├── slack/
 │   ├── client.rs    # Slack REST API client (reqwest)
-│   └── rtm.rs       # RTM WebSocket with auto-reconnect
+│   └── rtm.rs       # RTM WebSocket (legacy, unused)
 └── tui/
     ├── mod.rs       # App state, event loop, key dispatch
     └── layout.rs    # 3-pane ratatui layout rendering

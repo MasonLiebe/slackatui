@@ -270,19 +270,17 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((scroll_y as u16, 0));
         frame.render_widget(paragraph, area);
     } else {
-        // No selection: scroll to bottom
-        let scroll_y = if line_count > height {
-            (line_count - height) as u16
-        } else {
-            0
-        };
-        let scroll_y = scroll_y.saturating_sub(app.chat_scroll as u16);
+        // No selection: scroll to bottom, with chat_scroll as offset from bottom
+        let max_scroll = line_count.saturating_sub(height);
+        // Clamp chat_scroll to actual content range
+        let clamped_scroll = app.chat_scroll.min(max_scroll);
+        let scroll_y = max_scroll.saturating_sub(clamped_scroll);
 
         let paragraph = Paragraph::new(Text::from(
             all_lines.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
         ))
         .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
+        .scroll((scroll_y as u16, 0));
         frame.render_widget(paragraph, area);
     }
 }
@@ -357,14 +355,11 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
 
-    // Scroll to bottom for threads too
+    // Scroll to bottom for threads too, clamped to content range
     let line_count = paragraph.line_count(inner.width);
-    let scroll_y = if line_count > height {
-        (line_count - height) as u16
-    } else {
-        0
-    };
-    let scroll_y = scroll_y.saturating_sub(app.thread_scroll as u16);
+    let max_scroll = line_count.saturating_sub(height);
+    let clamped_scroll = app.thread_scroll.min(max_scroll);
+    let scroll_y = max_scroll.saturating_sub(clamped_scroll) as u16;
 
     let paragraph = Paragraph::new(
         app.thread_messages
