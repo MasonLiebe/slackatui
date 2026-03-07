@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod parse;
 mod slack;
+mod tui;
 mod types;
 
 use config::Config;
@@ -16,9 +17,8 @@ fn main() {
         }
     };
 
-    println!("slackatui v0.1.0");
-    println!("Config loaded from: {}", config_path.display());
-    println!("  sidebar_width: {}", cfg.sidebar_width);
-    println!("  emoji: {}", cfg.emoji);
-    println!("  token_store: {}", cfg.auth.token_store);
+    if let Err(e) = tui::run(cfg) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 }

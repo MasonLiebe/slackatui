@@ -24,6 +24,8 @@ tracing = "0.1"
 emojis = "0.8"
 regex = "1"
 htmlescape = "0.3"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tempfile = "3"
