@@ -90,10 +90,24 @@ fn account_key(team_id: &str) -> &str {
 // --- Keychain backend (macOS `security` CLI) ---
 
 /// Save tokens to macOS Keychain.
+/// Always stores under the team_id key AND under "default" so that loading
+/// without a specific team_id finds the most recently stored tokens.
 pub fn store_tokens_keychain(tokens: &StoredTokens) -> Result<(), StoreError> {
     let data = serde_json::to_string(tokens).map_err(|e| StoreError::Json(e.to_string()))?;
     let account = account_key(&tokens.team_id);
 
+    // Store under the team-specific key
+    keychain_set(account, &data)?;
+
+    // Also store under "default" so load_tokens with empty team_id works
+    if account != "default" {
+        keychain_set("default", &data)?;
+    }
+
+    Ok(())
+}
+
+fn keychain_set(account: &str, data: &str) -> Result<(), StoreError> {
     // Remove existing entry (ignore error if not found)
     let _ = Command::new("security")
         .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
@@ -107,7 +121,7 @@ pub fn store_tokens_keychain(tokens: &StoredTokens) -> Result<(), StoreError> {
             "-a",
             account,
             "-w",
-            &data,
+            data,
         ])
         .output()
         .map_err(|e| StoreError::KeychainError(e.to_string()))?;

@@ -197,7 +197,10 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     command.insert("C-d".into(), "chat-down".into());
     command.insert("n".into(), "channel-search-next".into());
     command.insert("N".into(), "channel-search-prev".into());
-    command.insert("'".into(), "channel-jump".into());
+    command.insert("l".into(), "focus-right".into());
+    command.insert("h".into(), "focus-left".into());
+    command.insert("<enter>".into(), "select".into());
+    command.insert("'".into(), "open-thread".into());
     command.insert("q".into(), "quit".into());
     command.insert("<f1>".into(), "help".into());
     key_map.insert("command".into(), command);

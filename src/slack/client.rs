@@ -243,6 +243,22 @@ impl SlackClient {
         Ok(resp.messages)
     }
 
+    /// Fetch messages newer than a given timestamp.
+    pub async fn get_new_messages(
+        &self,
+        channel_id: &str,
+        oldest: &str,
+    ) -> Result<Vec<SlackMessage>, SlackError> {
+        let params = [
+            ("channel", channel_id),
+            ("oldest", oldest),
+            ("inclusive", "false"),
+            ("limit", "100"),
+        ];
+        let resp: ConversationHistoryResponse = self.get("conversations.history", &params).await?;
+        Ok(resp.messages)
+    }
+
     /// Fetch a single message by its timestamp ID.
     pub async fn get_message_by_id(
         &self,
@@ -565,6 +581,8 @@ pub struct SlackMessage {
     pub thread_ts: String,
     #[serde(default, rename = "subtype")]
     pub sub_type: String,
+    #[serde(default)]
+    pub reply_count: u32,
     #[serde(default)]
     pub attachments: Vec<SlackAttachment>,
     #[serde(default)]

@@ -52,10 +52,12 @@ impl ChannelItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
+    pub timestamp: String,
     pub time: DateTime<Local>,
     pub name: String,
     pub content: String,
     pub thread: String,
+    pub reply_count: u32,
     pub messages: HashMap<String, Message>,
     pub style_time: String,
     pub style_thread: String,
@@ -67,11 +69,13 @@ pub struct Message {
 impl Message {
     pub fn new(id: String, name: String, content: String, time: DateTime<Local>) -> Self {
         Self {
-            id,
+            id: id.clone(),
+            timestamp: id,
             time,
             name,
             content,
             thread: String::new(),
+            reply_count: 0,
             messages: HashMap::new(),
             style_time: String::new(),
             style_thread: String::new(),
@@ -93,6 +97,7 @@ pub enum Mode {
 /// Which pane has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    Channels,
     Chat,
     Thread,
 }

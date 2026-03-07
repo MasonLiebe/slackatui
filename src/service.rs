@@ -118,6 +118,24 @@ impl SlackService {
         Ok(messages)
     }
 
+    /// Fetch only messages newer than `oldest_ts` for a channel.
+    pub async fn get_new_messages(
+        &self,
+        channel_id: &str,
+        oldest_ts: &str,
+    ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+        let slack_msgs = self.client.get_new_messages(channel_id, oldest_ts).await?;
+
+        let mut messages: Vec<Message> = slack_msgs
+            .iter()
+            .map(|sm| self.slack_message_to_message(sm))
+            .collect();
+
+        // API returns newest first; reverse so oldest is first
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Fetch thread replies and convert to Messages.
     pub async fn get_thread_messages(
         &self,
@@ -146,13 +164,10 @@ impl SlackService {
 
         let mut msg = Message::new(sm.timestamp.clone(), name, content, time);
         msg.id = hash;
+        msg.reply_count = sm.reply_count;
 
-        // Mark as threaded if it has a thread_ts different from its own ts
-        if !sm.thread_ts.is_empty() && sm.thread_ts != sm.timestamp {
-            msg.thread = parse::hash_id(&sm.thread_ts);
-        } else if !sm.thread_ts.is_empty() && sm.thread_ts == sm.timestamp {
-            // This is a thread parent
-            msg.thread = parse::hash_id(&sm.thread_ts);
+        if !sm.thread_ts.is_empty() {
+            msg.thread = sm.thread_ts.clone();
         }
 
         msg

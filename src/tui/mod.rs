@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::service::SlackService;
-use crate::slack::rtm::{self, RtmEvent};
 use crate::types::{ChannelItem, Focus, Message, Mode};
 
 /// Application state shared across all TUI components.
@@ -30,6 +29,7 @@ pub struct App {
     // Chat messages for the selected channel
     pub messages: Vec<Message>,
     pub chat_scroll: usize,
+    pub selected_message: Option<usize>,
 
     // Thread messages for the selected thread
     pub thread_messages: Vec<Message>,
@@ -53,13 +53,14 @@ impl App {
         Self {
             config,
             mode: Mode::Command,
-            focus: Focus::Chat,
+            focus: Focus::Channels,
             running: true,
             channels: Vec::new(),
             selected_channel: 0,
             channel_scroll: 0,
             messages: Vec::new(),
             chat_scroll: 0,
+            selected_message: None,
             thread_messages: Vec::new(),
             thread_scroll: 0,
             thread_visible: false,
@@ -112,14 +113,59 @@ impl App {
         }
     }
 
+    /// Move message selection up.
+    pub fn message_up(&mut self) {
+        if let Some(idx) = self.selected_message {
+            if idx > 0 {
+                self.selected_message = Some(idx - 1);
+            }
+        }
+    }
+
+    /// Move message selection down.
+    pub fn message_down(&mut self) {
+        if let Some(idx) = self.selected_message {
+            if idx + 1 < self.messages.len() {
+                self.selected_message = Some(idx + 1);
+            }
+        }
+    }
+
+    /// Move message selection to top.
+    pub fn message_top(&mut self) {
+        if !self.messages.is_empty() {
+            self.selected_message = Some(0);
+        }
+    }
+
+    /// Move message selection to bottom.
+    pub fn message_bottom(&mut self) {
+        if !self.messages.is_empty() {
+            self.selected_message = Some(self.messages.len() - 1);
+        }
+    }
+
     /// Scroll chat up by a page.
     pub fn chat_up(&mut self) {
-        self.chat_scroll = self.chat_scroll.saturating_add(10);
+        if self.selected_message.is_some() {
+            if let Some(idx) = self.selected_message {
+                self.selected_message = Some(idx.saturating_sub(10));
+            }
+        } else {
+            self.chat_scroll = self.chat_scroll.saturating_add(10);
+        }
     }
 
     /// Scroll chat down by a page.
     pub fn chat_down(&mut self) {
-        self.chat_scroll = self.chat_scroll.saturating_sub(10);
+        if self.selected_message.is_some() {
+            if let Some(idx) = self.selected_message {
+                let max = self.messages.len().saturating_sub(1);
+                self.selected_message = Some((idx + 10).min(max));
+            }
+        } else {
+            self.chat_scroll = self.chat_scroll.saturating_sub(10);
+        }
     }
 
     /// Scroll thread up.
@@ -260,10 +306,6 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
         }
     }
 
-    // Start RTM connection
-    let rtm_client = crate::slack::SlackClient::new(&svc.client.token());
-    let mut rtm_rx = rtm::start_rtm(rtm_client);
-
     // Create a channel for async actions triggered by key events
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AsyncAction>();
 
@@ -278,7 +320,6 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
         &mut terminal,
         &mut app,
         &mut svc,
-        &mut rtm_rx,
         &action_tx,
         &mut action_rx,
     )
@@ -295,23 +336,28 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
 enum AsyncAction {
     SendMessage { text: String },
     SelectChannel { index: usize },
+    OpenThread { channel_id: String, thread_ts: String },
 }
 
-/// The async main event loop: render, poll for keyboard + RTM events.
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// The async main event loop: render, poll for keyboard events and new messages.
 async fn async_main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     svc: &mut SlackService,
-    rtm_rx: &mut mpsc::UnboundedReceiver<RtmEvent>,
     action_tx: &mpsc::UnboundedSender<AsyncAction>,
     action_rx: &mut mpsc::UnboundedReceiver<AsyncAction>,
 ) -> io::Result<()> {
+    let mut poll_timer = tokio::time::interval(POLL_INTERVAL);
+    // Skip the first immediate tick
+    poll_timer.tick().await;
+
     while app.running {
         terminal.draw(|frame| {
             layout::render(frame, app);
         })?;
 
-        // Use tokio::select to handle keyboard events, RTM events, and async actions
         tokio::select! {
             // Check for keyboard events (non-blocking poll)
             _ = tokio::task::yield_now() => {
@@ -322,9 +368,9 @@ async fn async_main_loop(
                 }
             }
 
-            // RTM events from the WebSocket
-            Some(rtm_event) = rtm_rx.recv() => {
-                handle_rtm_event(app, svc, rtm_event).await;
+            // Poll for new messages periodically
+            _ = poll_timer.tick() => {
+                poll_new_messages(app, svc).await;
             }
 
             // Async actions from key handlers
@@ -337,82 +383,33 @@ async fn async_main_loop(
     Ok(())
 }
 
-/// Handle an RTM event: update app state with new messages, presence changes.
-async fn handle_rtm_event(app: &mut App, svc: &mut SlackService, event: RtmEvent) {
-    match event {
-        RtmEvent::Message(msg_event) => {
-            let current_channel_id = app
-                .current_channel()
-                .map(|ch| ch.id.clone())
+/// Poll the active channel for new messages since the last known message.
+async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
+    let (ch_id, oldest_ts) = match app.current_channel() {
+        Some(ch) => {
+            let oldest = app
+                .messages
+                .last()
+                .map(|m| m.timestamp.clone())
                 .unwrap_or_default();
+            (ch.id.clone(), oldest)
+        }
+        None => return,
+    };
 
-            match msg_event.sub_type.as_str() {
-                "" => {
-                    // Regular message
-                    if msg_event.channel == current_channel_id {
-                        let name = svc.resolve_user_or_bot(&msg_event.user, &msg_event.bot_id, &msg_event.username);
-                        let content = crate::parse::parse_message(
-                            &msg_event.text,
-                            svc.emoji_enabled,
-                            &svc.user_cache,
-                        );
-                        let time = crate::service::parse_slack_timestamp(&msg_event.ts);
-                        let mut message = Message::new(msg_event.ts.clone(), name, content, time);
-                        message.id = crate::parse::hash_id(&msg_event.ts);
+    if oldest_ts.is_empty() {
+        return;
+    }
 
-                        if !msg_event.thread_ts.is_empty() && msg_event.thread_ts != msg_event.ts {
-                            message.thread = crate::parse::hash_id(&msg_event.thread_ts);
-                        }
-
-                        app.messages.push(message);
-                        app.chat_scroll = 0; // Scroll to bottom on new message
-                    }
-
-                    // Update notification for other channels
-                    if msg_event.channel != current_channel_id {
-                        for ch in &mut app.channels {
-                            if ch.id == msg_event.channel {
-                                ch.notification = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                "message_changed" => {
-                    if msg_event.channel == current_channel_id {
-                        if let Some(sub) = &msg_event.message {
-                            for m in &mut app.messages {
-                                if m.id == crate::parse::hash_id(&sub.ts) {
-                                    m.content = crate::parse::parse_message(
-                                        &sub.text,
-                                        svc.emoji_enabled,
-                                        &svc.user_cache,
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+    match svc.get_new_messages(&ch_id, &oldest_ts).await {
+        Ok(new_msgs) if !new_msgs.is_empty() => {
+            app.messages.extend(new_msgs);
+            app.chat_scroll = 0; // Scroll to bottom on new messages
         }
-        RtmEvent::PresenceChange(ev) => {
-            for ch in &mut app.channels {
-                if ch.user_id == ev.user {
-                    ch.presence = ev.presence.clone();
-                }
-            }
+        Err(_) => {
+            // Silently ignore poll errors to avoid spamming the status bar
         }
-        RtmEvent::Connected => {
-            app.status = "Connected".to_string();
-        }
-        RtmEvent::Disconnected => {
-            app.status = "Disconnected, reconnecting...".to_string();
-        }
-        RtmEvent::Error(msg) => {
-            app.status = format!("RTM error: {}", msg);
-        }
+        _ => {}
     }
 }
 
@@ -444,8 +441,10 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 app.selected_channel = index;
                 app.messages.clear();
                 app.chat_scroll = 0;
+                app.selected_message = None;
                 app.thread_messages.clear();
                 app.thread_visible = false;
+                app.focus = Focus::Channels;
 
                 let ch_id = app.channels[index].id.clone();
                 app.channels[index].notification = false;
@@ -454,6 +453,16 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                     Ok(msgs) => app.messages = msgs,
                     Err(e) => app.status = format!("Error: {}", e),
                 }
+            }
+        }
+        AsyncAction::OpenThread { channel_id, thread_ts } => {
+            match svc.get_thread_messages(&channel_id, &thread_ts).await {
+                Ok(msgs) => {
+                    app.thread_messages = msgs;
+                    app.thread_visible = true;
+                    app.thread_scroll = 0;
+                }
+                Err(e) => app.status = format!("Thread error: {}", e),
             }
         }
     }
@@ -523,41 +532,99 @@ fn dispatch_action(
             app.status = "/".to_string();
         }
 
-        // Channel navigation (triggers async channel load)
-        "channel-up" => {
-            let prev = app.selected_channel;
-            app.channel_up();
-            if app.selected_channel != prev {
-                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+        // Focus-aware up/down navigation
+        "channel-up" => match app.focus {
+            Focus::Channels => {
+                let prev = app.selected_channel;
+                app.channel_up();
+                if app.selected_channel != prev {
+                    let _ = action_tx.send(AsyncAction::SelectChannel {
+                        index: app.selected_channel,
+                    });
+                }
             }
-        }
-        "channel-down" => {
-            let prev = app.selected_channel;
-            app.channel_down();
-            if app.selected_channel != prev {
-                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            Focus::Chat => app.message_up(),
+            Focus::Thread => app.thread_up(),
+        },
+        "channel-down" => match app.focus {
+            Focus::Channels => {
+                let prev = app.selected_channel;
+                app.channel_down();
+                if app.selected_channel != prev {
+                    let _ = action_tx.send(AsyncAction::SelectChannel {
+                        index: app.selected_channel,
+                    });
+                }
             }
-        }
-        "channel-top" => {
-            let prev = app.selected_channel;
-            app.channel_top();
-            if app.selected_channel != prev {
-                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            Focus::Chat => app.message_down(),
+            Focus::Thread => app.thread_down(),
+        },
+        "channel-top" => match app.focus {
+            Focus::Channels => {
+                let prev = app.selected_channel;
+                app.channel_top();
+                if app.selected_channel != prev {
+                    let _ = action_tx.send(AsyncAction::SelectChannel {
+                        index: app.selected_channel,
+                    });
+                }
             }
-        }
-        "channel-bottom" => {
-            let prev = app.selected_channel;
-            app.channel_bottom();
-            if app.selected_channel != prev {
-                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            Focus::Chat => app.message_top(),
+            Focus::Thread => {}
+        },
+        "channel-bottom" => match app.focus {
+            Focus::Channels => {
+                let prev = app.selected_channel;
+                app.channel_bottom();
+                if app.selected_channel != prev {
+                    let _ = action_tx.send(AsyncAction::SelectChannel {
+                        index: app.selected_channel,
+                    });
+                }
             }
+            Focus::Chat => app.message_bottom(),
+            Focus::Thread => {}
+        },
+
+        // Focus navigation
+        "focus-right" | "select" => match app.focus {
+            Focus::Channels => {
+                app.focus = Focus::Chat;
+                if app.selected_message.is_none() && !app.messages.is_empty() {
+                    app.selected_message = Some(app.messages.len() - 1);
+                }
+            }
+            Focus::Chat => {
+                try_open_thread(app, action_tx);
+            }
+            Focus::Thread => {}
+        },
+        "focus-left" => match app.focus {
+            Focus::Thread => {
+                app.focus = Focus::Chat;
+            }
+            Focus::Chat => {
+                app.focus = Focus::Channels;
+                app.selected_message = None;
+            }
+            Focus::Channels => {}
+        },
+        "open-thread" => {
+            if app.focus == Focus::Channels {
+                // Enter chat first, then try thread
+                app.focus = Focus::Chat;
+                if app.selected_message.is_none() && !app.messages.is_empty() {
+                    app.selected_message = Some(app.messages.len() - 1);
+                }
+            }
+            try_open_thread(app, action_tx);
         }
 
         // Chat scrolling
         "chat-up" => app.chat_up(),
         "chat-down" => app.chat_down(),
 
-        // Thread scrolling
+        // Thread scrolling (always operates on thread pane)
         "thread-up" => app.thread_up(),
         "thread-down" => app.thread_down(),
 
@@ -573,7 +640,7 @@ fn dispatch_action(
         }
         "delete" => {
             if app.mode == Mode::Search {
-                // no-op for search delete
+                // no-op
             } else {
                 app.input_delete();
             }
@@ -599,7 +666,6 @@ fn dispatch_action(
         // Search
         "clear-input" => {
             if !app.search_input.is_empty() {
-                // On first enter/escape in search mode, jump to first match
                 if let Some(idx) = app.channel_search_next() {
                     let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
                 }
@@ -619,24 +685,50 @@ fn dispatch_action(
                 let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
             }
         }
-        "channel-jump" => {
-            // Toggle thread visibility on the selected message
-            app.thread_visible = !app.thread_visible;
-            if !app.thread_visible {
-                app.thread_messages.clear();
-            }
-        }
 
         // Quit
         "quit" => app.running = false,
 
         // Help
         "help" => {
-            app.status = "Press i=insert, /=search, q=quit, j/k=channels, J/K=threads".to_string();
+            app.status =
+                "j/k=nav l=enter h=back i=insert /=search '=thread q=quit".to_string();
         }
 
         _ => {}
     }
+}
+
+/// Try to open the thread for the currently selected message.
+fn try_open_thread(app: &mut App, action_tx: &mpsc::UnboundedSender<AsyncAction>) {
+    let Some(idx) = app.selected_message else {
+        return;
+    };
+    let Some(msg) = app.messages.get(idx) else {
+        return;
+    };
+
+    // Determine the thread_ts: for thread parents thread == timestamp,
+    // for replies thread points to parent. Either way, use it.
+    let thread_ts = if !msg.thread.is_empty() {
+        msg.thread.clone()
+    } else if msg.reply_count > 0 {
+        msg.timestamp.clone()
+    } else {
+        return;
+    };
+
+    let ch_id = app
+        .current_channel()
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+
+    let _ = action_tx.send(AsyncAction::OpenThread {
+        channel_id: ch_id,
+        thread_ts,
+    });
+    app.thread_visible = true;
+    app.focus = Focus::Thread;
 }
 
 /// Convert a crossterm key event to the config key string format.
@@ -686,7 +778,7 @@ mod tests {
     fn test_app_initial_state() {
         let app = test_app();
         assert_eq!(app.mode, Mode::Command);
-        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.focus, Focus::Channels);
         assert!(app.running);
         assert!(app.channels.is_empty());
         assert!(app.messages.is_empty());
