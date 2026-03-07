@@ -4,11 +4,14 @@ use crossterm::{
     event::{
         self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        EnableBracketedPaste, DisableBracketedPaste,
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use ratatui::prelude::*;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::time::Duration;
@@ -58,9 +61,14 @@ pub struct App {
     pub react_results: Vec<(String, String)>, // (shortcode, emoji_char)
     pub react_selected: usize,
 
-    // Image cache: file_id -> rendered pixel rows (each row = Vec of (fg, bg) color pairs)
-    pub image_cache: HashMap<String, Vec<Vec<(Color, Color)>>>,
-    pub image_pending: std::collections::HashSet<String>,
+    // Image rendering
+    pub picker: Picker,
+    pub image_cache: HashMap<String, StatefulProtocol>,
+
+    // Upload file path input
+    pub upload_path: String,
+    // Staged files waiting to be uploaded (from drag-and-drop)
+    pub staged_files: Vec<String>,
 
     // Status / mode indicator
     pub status: String,
@@ -92,8 +100,10 @@ impl App {
             react_query: String::new(),
             react_results: Vec::new(),
             react_selected: 0,
+            picker: Picker::from_fontsize((8, 16)),
             image_cache: HashMap::new(),
-            image_pending: std::collections::HashSet::new(),
+            upload_path: String::new(),
+            staged_files: Vec::new(),
             status: String::new(),
         }
     }
@@ -109,7 +119,7 @@ impl App {
             Mode::Command => "command",
             Mode::Insert => "insert",
             Mode::Search => "search",
-            Mode::React => return None, // React mode handles keys inline
+            Mode::React | Mode::Upload => return None, // handled inline
         };
         self.config.key_map.get(mode_key)
     }
@@ -347,10 +357,6 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     // Create a channel for async actions triggered by key events
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AsyncAction>();
 
-    // Queue image downloads for initial messages
-    let initial_msgs = app.messages.clone();
-    queue_image_downloads(&mut app, &initial_msgs, &action_tx);
-
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -358,8 +364,15 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     let _ = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
     ));
+    // Enable bracketed paste so drag-and-drop file paths arrive as Paste events
+    let _ = stdout().execute(EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    // Query terminal for image protocol support (sixel, kitty, iterm2, or halfblocks fallback)
+    if let Ok(picker) = Picker::from_query_stdio() {
+        app.picker = picker;
+    }
 
     // Splash screen
     show_splash(&mut terminal).await?;
@@ -375,6 +388,7 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     .await;
 
     // Restore terminal
+    let _ = stdout().execute(DisableBracketedPaste);
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
@@ -382,41 +396,44 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
     result
 }
 
-/// Show an animated splash screen. Typewriter effect, then wait for any key.
+/// Show an animated splash screen with rain effect, logo reveal, and color wave.
 async fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    // Total characters to animate (logo + welcome message)
-    // We'll reveal ~4 chars per frame at 30ms intervals for a snappy typewriter
-    let total_frames = 80; // enough to cover logo + message + hint
-    let chars_per_frame = 5;
+    let size = terminal.size()?;
+    let mut state = layout::SplashState::new(size.width, size.height);
 
-    for frame_idx in 0..=total_frames {
-        let char_count = frame_idx * chars_per_frame;
+    let total_ticks = 70;
+
+    for tick in 0..=total_ticks {
         terminal.draw(|f| {
-            layout::render_splash(f, char_count);
+            layout::render_splash(f, tick, &mut state);
         })?;
 
         // Check if user pressed a key to skip
-        if event::poll(Duration::from_millis(18))? {
-            if let Event::Key(_) = event::read()? {
-                // Draw the fully revealed splash once, then break
-                terminal.draw(|f| {
-                    layout::render_splash(f, 9999);
-                })?;
-                break;
+        if event::poll(Duration::from_millis(25))? {
+            match event::read()? {
+                Event::Key(_) | Event::Paste(_) => {
+                    // Draw the final frame and break
+                    terminal.draw(|f| {
+                        layout::render_splash(f, 9999, &mut state);
+                    })?;
+                    break;
+                }
+                _ => {}
             }
         }
     }
 
     // Wait for any key press to dismiss (with a timeout so it auto-dismisses)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(_) = event::read()? {
-                break;
+            match event::read()? {
+                Event::Key(_) | Event::Paste(_) => break,
+                _ => {}
             }
         }
     }
@@ -430,9 +447,8 @@ enum AsyncAction {
     SelectChannel { index: usize },
     OpenThread { channel_id: String, thread_ts: String },
     ToggleReaction { channel_id: String, timestamp: String, emoji_name: String, msg_idx: usize },
-    DownloadImage { file_id: String, url: String },
-    ImageReady { file_id: String, rows: Vec<Vec<(Color, Color)>> },
-    ImageFailed { file_id: String },
+    OpenFile { file_id: String, url: String, title: String, is_image: bool },
+    UploadFile { channel_id: String, file_path: String, thread_ts: Option<String> },
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -455,23 +471,29 @@ async fn async_main_loop(
         })?;
 
         tokio::select! {
-            // Check for keyboard events (non-blocking poll)
+            // Check for keyboard/paste events (non-blocking poll)
             _ = tokio::task::yield_now() => {
                 if event::poll(Duration::from_millis(50))? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key_async(app, key.code, key.modifiers, action_tx);
+                    match event::read()? {
+                        Event::Key(key) => {
+                            handle_key_async(app, key.code, key.modifiers, action_tx);
+                        }
+                        Event::Paste(data) => {
+                            handle_paste(app, data, action_tx);
+                        }
+                        _ => {}
                     }
                 }
             }
 
             // Poll for new messages periodically
             _ = poll_timer.tick() => {
-                poll_new_messages(app, svc, action_tx).await;
+                poll_new_messages(app, svc).await;
             }
 
             // Async actions from key handlers
             Some(action) = action_rx.recv() => {
-                handle_async_action(app, svc, action, action_tx).await;
+                handle_async_action(app, svc, action).await;
             }
         }
     }
@@ -480,11 +502,7 @@ async fn async_main_loop(
 }
 
 /// Poll the active channel for new messages since the last known message.
-async fn poll_new_messages(
-    app: &mut App,
-    svc: &mut SlackService,
-    action_tx: &mpsc::UnboundedSender<AsyncAction>,
-) {
+async fn poll_new_messages(app: &mut App, svc: &mut SlackService) {
     let (ch_id, oldest_ts) = match app.current_channel() {
         Some(ch) => {
             // Use the last real (non-optimistic) message timestamp
@@ -508,7 +526,6 @@ async fn poll_new_messages(
         Ok(new_msgs) if !new_msgs.is_empty() => {
             // Remove optimistic messages — real ones are arriving
             app.messages.retain(|m| !m.timestamp.starts_with("optimistic_"));
-            queue_image_downloads(app, &new_msgs, action_tx);
             app.messages.extend(new_msgs);
             app.chat_scroll = 0; // Scroll to bottom on new messages
         }
@@ -520,31 +537,7 @@ async fn poll_new_messages(
 }
 
 /// Handle async actions triggered by key events.
-/// Queue image downloads for any image files in the given messages that aren't already cached/pending.
-fn queue_image_downloads(
-    app: &mut App,
-    messages: &[Message],
-    action_tx: &mpsc::UnboundedSender<AsyncAction>,
-) {
-    for msg in messages {
-        for img in &msg.image_files {
-            if !app.image_cache.contains_key(&img.file_id) && !app.image_pending.contains(&img.file_id) {
-                app.image_pending.insert(img.file_id.clone());
-                let _ = action_tx.send(AsyncAction::DownloadImage {
-                    file_id: img.file_id.clone(),
-                    url: img.url.clone(),
-                });
-            }
-        }
-    }
-}
-
-async fn handle_async_action(
-    app: &mut App,
-    svc: &mut SlackService,
-    action: AsyncAction,
-    action_tx: &mpsc::UnboundedSender<AsyncAction>,
-) {
+async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: AsyncAction) {
     match action {
         AsyncAction::SendMessage { text, thread_ts } => {
             if let Some(ch) = app.current_channel() {
@@ -573,11 +566,7 @@ async fn handle_async_action(
                 app.channels[index].notification = false;
 
                 match svc.get_messages(&ch_id, 50).await {
-                    Ok(msgs) => {
-                        app.messages = msgs;
-                        let msgs_ref = app.messages.clone();
-                        queue_image_downloads(app, &msgs_ref, action_tx);
-                    }
+                    Ok(msgs) => app.messages = msgs,
                     Err(e) => app.status = format!("Error: {}", e),
                 }
             }
@@ -640,69 +629,107 @@ async fn handle_async_action(
                 }
             }
         }
-        AsyncAction::DownloadImage { file_id, url } => {
-            // Spawn as background task to avoid blocking the UI
-            let token = svc.client.token().to_string();
-            let fid = file_id.clone();
-            let tx = action_tx.clone();
-            tokio::spawn(async move {
-                let client = reqwest::Client::new();
-                let result = client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .and_then(|r| Ok(r));
-                match result {
-                    Ok(resp) if resp.status().is_success() => {
-                        if let Ok(bytes) = resp.bytes().await {
-                            if let Ok(img) = image::load_from_memory(&bytes) {
-                                let max_width: u32 = 60;
-                                let max_height: u32 = 30;
-                                let img = img.thumbnail(max_width, max_height * 2);
-                                let rgba = img.to_rgba8();
-                                let (w, h) = rgba.dimensions();
-
-                                let mut rows: Vec<Vec<(Color, Color)>> = Vec::new();
-                                let mut y = 0u32;
-                                while y < h {
-                                    let mut row = Vec::new();
-                                    for x in 0..w {
-                                        let top = rgba.get_pixel(x, y);
-                                        let bottom = if y + 1 < h {
-                                            rgba.get_pixel(x, y + 1)
-                                        } else {
-                                            top
-                                        };
-                                        let fg = Color::Rgb(top[0], top[1], top[2]);
-                                        let bg = Color::Rgb(bottom[0], bottom[1], bottom[2]);
-                                        row.push((fg, bg));
-                                    }
-                                    rows.push(row);
-                                    y += 2;
+        AsyncAction::OpenFile { file_id, url, title, is_image } => {
+            app.status = format!("Downloading {}...", title);
+            match svc.client.download_file(&url).await {
+                Ok(bytes) => {
+                    if is_image {
+                        // Slack may return HTML (auth redirect) instead of image bytes
+                        if bytes.starts_with(b"<") || bytes.starts_with(b"\xef\xbb\xbf<") {
+                            app.status = "Auth error: re-run `slackatui auth` for files:read scope".to_string();
+                        } else {
+                            let cursor = std::io::Cursor::new(&bytes);
+                            let decode_result = image::ImageReader::new(std::io::BufReader::new(cursor))
+                                .with_guessed_format()
+                                .and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+                            match decode_result {
+                                Ok(dyn_img) => {
+                                    let protocol = app.picker.new_resize_protocol(dyn_img);
+                                    app.image_cache.insert(file_id, protocol);
+                                    app.status = format!("Loaded {}", title);
                                 }
-
-                                let _ = tx.send(AsyncAction::ImageReady {
-                                    file_id: fid,
-                                    rows,
-                                });
-                                return;
+                                Err(e) => {
+                                    app.status = format!("Image decode error: {}", e);
+                                }
                             }
                         }
-                        let _ = tx.send(AsyncAction::ImageFailed { file_id: fid });
-                    }
-                    _ => {
-                        let _ = tx.send(AsyncAction::ImageFailed { file_id: fid });
+                    } else {
+                        // Non-image: save to temp and open with system viewer
+                        let tmp_dir = std::env::temp_dir().join("slackatui");
+                        let _ = std::fs::create_dir_all(&tmp_dir);
+                        let tmp_path = tmp_dir.join(&title);
+                        if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                            app.status = format!("Write error: {}", e);
+                        } else if let Err(e) = open::that(&tmp_path) {
+                            app.status = format!("Open error: {}", e);
+                        } else {
+                            app.status = format!("Opened {}", title);
+                        }
                     }
                 }
-            });
+                Err(e) => {
+                    app.status = format!("Download error: {}", e);
+                }
+            }
         }
-        AsyncAction::ImageReady { file_id, rows } => {
-            app.image_cache.insert(file_id.clone(), rows);
-            app.image_pending.remove(&file_id);
-        }
-        AsyncAction::ImageFailed { file_id } => {
-            app.image_pending.remove(&file_id);
+        AsyncAction::UploadFile { channel_id, file_path, thread_ts } => {
+            // Expand ~ to home directory
+            let expanded = if file_path.starts_with("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(&file_path[2..])
+                } else {
+                    std::path::PathBuf::from(&file_path)
+                }
+            } else {
+                std::path::PathBuf::from(&file_path)
+            };
+
+            let filename = expanded
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+
+            app.status = format!("Uploading {}...", filename);
+
+            // Read file
+            let data = match std::fs::read(&expanded) {
+                Ok(d) => d,
+                Err(e) => {
+                    app.status = format!("Read error: {}", e);
+                    return;
+                }
+            };
+            let length = data.len() as u64;
+
+            // Step 1: Get upload URL
+            let upload_resp = match svc.client.get_upload_url(&filename, length).await {
+                Ok(r) => r,
+                Err(e) => {
+                    app.status = format!("Upload error: {}", e);
+                    return;
+                }
+            };
+
+            // Step 2: Upload data
+            if let Err(e) = svc.client.upload_to_url(&upload_resp.upload_url, data).await {
+                app.status = format!("Upload error: {}", e);
+                return;
+            }
+
+            // Step 3: Complete upload and share to channel
+            match svc.client.complete_upload(
+                &upload_resp.file_id,
+                &filename,
+                &channel_id,
+                thread_ts.as_deref(),
+            ).await {
+                Ok(_) => {
+                    app.status = format!("Uploaded {}", filename);
+                }
+                Err(e) => {
+                    app.status = format!("Upload error: {}", e);
+                }
+            }
         }
     }
 }
@@ -806,7 +833,51 @@ fn handle_key_async(
                 _ => {}
             }
         }
+        Mode::Upload => {
+            match code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Command;
+                    app.upload_path.clear();
+                    app.status.clear();
+                }
+                KeyCode::Enter => {
+                    let path = app.upload_path.trim().to_string();
+                    if !path.is_empty() {
+                        if let Some(ch) = app.current_channel() {
+                            let ch_id = ch.id.clone();
+                            let thread_ts = app.reply_thread_ts.clone();
+                            let _ = action_tx.send(AsyncAction::UploadFile {
+                                channel_id: ch_id,
+                                file_path: path,
+                                thread_ts,
+                            });
+                        }
+                    }
+                    app.mode = Mode::Command;
+                    app.upload_path.clear();
+                    app.reply_thread_ts = None;
+                }
+                KeyCode::Backspace => {
+                    app.upload_path.pop();
+                }
+                KeyCode::Char(c) => {
+                    let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    app.upload_path.push(ch);
+                }
+                _ => {}
+            }
+        }
         Mode::Command => {
+            // x clears staged files
+            if !app.staged_files.is_empty() && key_str == "x" {
+                app.staged_files.clear();
+                app.status.clear();
+                return;
+            }
             if let Some(keymap) = app.current_keymap() {
                 if let Some(action) = keymap.get(&key_str) {
                     dispatch_action(app, action.clone(), action_tx);
@@ -816,12 +887,108 @@ fn handle_key_async(
     }
 }
 
+/// Handle a bracketed paste event (drag-and-drop files or pasted text).
+fn handle_paste(
+    app: &mut App,
+    data: String,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
+    // In insert mode, paste text directly into the input buffer
+    if app.mode == Mode::Insert {
+        for c in data.chars() {
+            if c != '\r' {
+                app.input_char(c);
+            }
+        }
+        return;
+    }
+
+    // In upload mode, replace the path input
+    if app.mode == Mode::Upload {
+        app.upload_path = data.trim().trim_matches('\'').trim_matches('"').to_string();
+        return;
+    }
+
+    // In command mode: detect file paths and stage them for upload
+    // Terminals may paste one or more file paths (newline-separated)
+    let paths: Vec<String> = data
+        .lines()
+        .map(|l| l.trim().trim_matches('\'').trim_matches('"').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if paths.is_empty() {
+        return;
+    }
+
+    // Check if they look like file paths
+    let file_paths: Vec<String> = paths
+        .into_iter()
+        .filter(|p| {
+            let expanded = if p.starts_with("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(&p[2..]))
+                    .unwrap_or_else(|| std::path::PathBuf::from(p))
+            } else {
+                std::path::PathBuf::from(p)
+            };
+            expanded.exists()
+        })
+        .collect();
+
+    if file_paths.is_empty() {
+        return;
+    }
+
+    for path in file_paths {
+        if !app.staged_files.contains(&path) {
+            app.staged_files.push(path);
+        }
+    }
+
+    let count = app.staged_files.len();
+    let names: Vec<&str> = app
+        .staged_files
+        .iter()
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+        })
+        .collect();
+    app.status = format!(
+        "{} file{} staged: {} — Enter=upload, x=clear",
+        count,
+        if count == 1 { "" } else { "s" },
+        names.join(", ")
+    );
+
+    let _ = action_tx; // suppress unused warning
+}
+
 /// Dispatch a named action from the keymap.
 fn dispatch_action(
     app: &mut App,
     action: String,
     action_tx: &mpsc::UnboundedSender<AsyncAction>,
 ) {
+    // If files are staged, Enter uploads them
+    if !app.staged_files.is_empty() && action == "select" {
+        if let Some(ch) = app.current_channel() {
+            let ch_id = ch.id.clone();
+            for path in app.staged_files.drain(..) {
+                let _ = action_tx.send(AsyncAction::UploadFile {
+                    channel_id: ch_id.clone(),
+                    file_path: path,
+                    thread_ts: None,
+                });
+            }
+        }
+        app.status.clear();
+        return;
+    }
+
     match action.as_str() {
         // Mode switching
         "mode-insert" => {
@@ -1106,13 +1273,44 @@ fn dispatch_action(
             }
         }
 
+        // Open file attached to selected message
+        "open-file" => {
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    if let Some(file) = msg.files.first() {
+                        if file.is_image && app.image_cache.contains_key(&file.file_id) {
+                            app.status = "Image already loaded".to_string();
+                        } else {
+                            let _ = action_tx.send(AsyncAction::OpenFile {
+                                file_id: file.file_id.clone(),
+                                url: file.url.clone(),
+                                title: file.title.clone(),
+                                is_image: file.is_image,
+                            });
+                        }
+                    } else {
+                        app.status = "No file on this message".to_string();
+                    }
+                }
+            }
+        }
+
+        // Upload file
+        "upload-file" => {
+            if app.current_channel().is_some() {
+                app.mode = Mode::Upload;
+                app.upload_path.clear();
+                app.status = "Enter file path to upload".to_string();
+            }
+        }
+
         // Quit
         "quit" => app.running = false,
 
         // Help
         "help" => {
             app.status =
-                "j/k=nav l=enter h=back i=insert /=search '=thread q=quit".to_string();
+                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload q=quit".to_string();
         }
 
         _ => {}

@@ -48,12 +48,13 @@ impl ChannelItem {
     }
 }
 
-/// An image file attached to a message.
+/// A file attached to a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageFile {
+pub struct AttachedFile {
     pub file_id: String,
     pub title: String,
     pub url: String,
+    pub is_image: bool,
 }
 
 /// A reaction on a message (emoji name + count + whether current user reacted).
@@ -76,7 +77,7 @@ pub struct Message {
     pub thread: String,
     pub reply_count: u32,
     pub reactions: Vec<Reaction>,
-    pub image_files: Vec<ImageFile>,
+    pub files: Vec<AttachedFile>,
     pub messages: HashMap<String, Message>,
     pub style_time: String,
     pub style_thread: String,
@@ -96,7 +97,7 @@ impl Message {
             thread: String::new(),
             reply_count: 0,
             reactions: Vec::new(),
-            image_files: Vec::new(),
+            files: Vec::new(),
             messages: HashMap::new(),
             style_time: String::new(),
             style_thread: String::new(),
@@ -114,6 +115,7 @@ pub enum Mode {
     Insert,
     Search,
     React,
+    Upload,
 }
 
 /// Which pane has focus.

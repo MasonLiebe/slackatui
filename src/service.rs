@@ -4,7 +4,7 @@ use chrono::{DateTime, Local, TimeZone};
 
 use crate::parse;
 use crate::slack::{Conversation, SlackClient, SlackMessage};
-use crate::types::{ChannelItem, ChannelType, ImageFile, Message, Reaction};
+use crate::types::{AttachedFile, ChannelItem, ChannelType, Message, Reaction};
 
 /// High-level service that wraps the Slack API client and manages
 /// user/bot caches, channel lists, and message creation.
@@ -170,13 +170,14 @@ impl SlackService {
             msg.thread = sm.thread_ts.clone();
         }
 
-        // Map image files
+        // Map attached files
         for f in &sm.files {
-            if f.is_image() && !f.url_private.is_empty() {
-                msg.image_files.push(ImageFile {
+            if !f.url_private.is_empty() {
+                msg.files.push(AttachedFile {
                     file_id: f.id.clone(),
                     title: f.title.clone(),
                     url: f.url_private.clone(),
+                    is_image: f.is_image(),
                 });
             }
         }
@@ -263,9 +264,9 @@ impl SlackService {
             }
         }
 
-        // Append file references (skip images — they're rendered inline)
+        // Append file references
         for file in &sm.files {
-            if !file.title.is_empty() && !file.is_image() {
+            if !file.title.is_empty() {
                 content.push_str(&format!("\n[file: {}]", file.title));
             }
         }
@@ -596,22 +597,6 @@ mod tests {
         assert!(content.contains("[file: report.pdf]"));
     }
 
-    #[test]
-    fn test_format_image_file_not_shown_as_file() {
-        let svc = make_service();
-        let sm = SlackMessage {
-            text: "check this".into(),
-            files: vec![SlackFile {
-                id: "F1".into(),
-                title: "photo.png".into(),
-                mimetype: "image/png".into(),
-                url_private: "https://example.com/photo.png".into(),
-            }],
-            ..Default::default()
-        };
-        let content = svc.format_message_content(&sm);
-        assert!(!content.contains("[file:"));
-    }
 
     // ---- slack_message_to_message ----
 

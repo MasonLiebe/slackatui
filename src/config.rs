@@ -203,6 +203,8 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     command.insert("'".into(), "open-thread".into());
     command.insert("r".into(), "reply".into());
     command.insert("e".into(), "mode-react".into());
+    command.insert("o".into(), "open-file".into());
+    command.insert("u".into(), "upload-file".into());
     command.insert("q".into(), "quit".into());
     command.insert("<f1>".into(), "help".into());
     key_map.insert("command".into(), command);

@@ -1,7 +1,7 @@
 use chrono::Datelike;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
-use std::collections::HashMap;
+use ratatui_image::StatefulImage;
 
 use super::App;
 use crate::parse;
@@ -27,72 +27,352 @@ const WELCOME_MESSAGES: &[&str] = &[
     "Slack from where you code.",
 ];
 
-/// Render the splash screen. `frame_idx` controls the typewriter animation (0..=total chars).
-pub fn render_splash(frame: &mut Frame, frame_idx: usize) {
-    let area = frame.area();
+/// Splash animation state, created once and mutated each frame.
+pub struct SplashState {
+    /// Sparkles: (x, y, birth_tick, char_idx)
+    sparkles: Vec<(usize, usize, usize, usize)>,
+    seed: u64,
+    welcome_idx: usize,
+}
 
-    // Pick a deterministic "random" welcome message based on current minute
-    let now = chrono::Local::now();
-    let msg_idx = (now.timestamp() / 60) as usize % WELCOME_MESSAGES.len();
-    let welcome = WELCOME_MESSAGES[msg_idx];
+const SPARKLE_CHARS: &[char] = &['\u{00B7}', '\u{2022}', '\u{2727}'];
 
-    // Total chars in the logo for the typewriter effect
-    let total_logo_chars: usize = LOGO.iter().map(|l| l.len()).sum();
+impl SplashState {
+    pub fn new(width: u16, height: u16) -> Self {
+        let now = chrono::Local::now();
+        let seed = now.timestamp_millis() as u64;
+        let w = width as usize;
+        let h = height as usize;
+        let mut state = SplashState {
+            sparkles: Vec::new(),
+            seed,
+            welcome_idx: (now.timestamp() / 60) as usize % WELCOME_MESSAGES.len(),
+        };
 
-    // Build logo lines with typewriter reveal
-    let mut chars_remaining = frame_idx;
-    let mut logo_lines: Vec<Line> = Vec::new();
-    for &logo_line in LOGO {
-        if chars_remaining == 0 {
-            break;
+        let num_sparkles = (w * h / 90).min(20);
+        for _ in 0..num_sparkles {
+            let r = state.next_rand();
+            let x = (r % w as u64) as usize;
+            let r2 = state.next_rand();
+            let y = (r2 % h as u64) as usize;
+            let r3 = state.next_rand();
+            let char_idx = (r3 % SPARKLE_CHARS.len() as u64) as usize;
+            let r4 = state.next_rand();
+            let birth = 5 + (r4 % 45) as usize;
+            state.sparkles.push((x, y, birth, char_idx));
         }
-        let visible = chars_remaining.min(logo_line.len());
-        chars_remaining = chars_remaining.saturating_sub(logo_line.len());
-        logo_lines.push(Line::from(Span::styled(
-            &logo_line[..visible],
-            Style::default().fg(Color::Rgb(100, 200, 140)).add_modifier(Modifier::BOLD),
-        )));
+
+        state
     }
 
-    // After logo is fully typed, show welcome message with a fade-in
-    let welcome_visible = frame_idx > total_logo_chars;
-    let subtitle_line = if welcome_visible {
-        let sub_chars = (frame_idx - total_logo_chars).min(welcome.len());
-        Line::from(Span::styled(
-            &welcome[..sub_chars],
-            Style::default().fg(Color::Rgb(180, 180, 220)),
-        ))
-    } else {
-        Line::default()
-    };
-
-    // Show "press any key" after everything is typed
-    let hint_visible = frame_idx > total_logo_chars + welcome.len();
-    let hint_line = if hint_visible {
-        Line::from(Span::styled(
-            "press any key to continue",
-            Style::default().fg(Color::Rgb(90, 90, 110)),
-        ))
-    } else {
-        Line::default()
-    };
-
-    // Center vertically: logo height + 2 blank + subtitle + 1 blank + hint
-    let content_height = logo_lines.len() + 4;
-    let top_pad = area.height.saturating_sub(content_height as u16) / 2;
-
-    let mut lines: Vec<Line> = Vec::new();
-    for _ in 0..top_pad {
-        lines.push(Line::default());
+    fn next_rand(&mut self) -> u64 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        self.seed
     }
-    lines.extend(logo_lines);
-    lines.push(Line::default());
-    lines.push(Line::default());
-    lines.push(subtitle_line);
-    lines.push(Line::default());
-    lines.push(hint_line);
+}
 
-    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+// Splash animation phases:
+//   0..14  - Stem grows upward
+//   10..32 - Flower petals bloom outward (with per-petal stagger)
+//   18..36 - Logo fades in above
+//   36..50 - Welcome message types in
+//   48..60 - Hint fades in
+//   60+    - Static final frame
+
+/// Render one frame of the splash animation.
+pub fn render_splash(frame: &mut Frame, tick: usize, state: &mut SplashState) {
+    let area = frame.area();
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let welcome = WELCOME_MESSAGES[state.welcome_idx];
+
+    let logo_w = LOGO.iter().map(|l| l.len()).max().unwrap_or(0);
+    let logo_h = LOGO.len();
+
+    // Layout: vertically center the composition
+    let flower_radius: f32 = 4.5;
+    let stem_h: usize = 4;
+    let content_h = logo_h + 2 + (flower_radius as usize) * 2 + 1 + stem_h + 4;
+    let top = h.saturating_sub(content_h) / 2;
+
+    let logo_top = top;
+    let logo_left = w.saturating_sub(logo_w) / 2;
+    let flower_cy = logo_top + logo_h + 2 + flower_radius as usize;
+    let flower_cx = w / 2;
+    let stem_top = flower_cy + flower_radius as usize + 1;
+    let welcome_y = stem_top + stem_h + 1;
+    let hint_y = welcome_y + 2;
+
+    let mut chars: Vec<Vec<(char, Style)>> =
+        vec![vec![(' ', Style::default()); w]; h];
+
+    // --- Stem grows upward (ticks 2..14) ---
+    if tick >= 2 {
+        let progress = ((tick as f32 - 2.0) / 12.0).clamp(0.0, 1.0);
+        let visible = (progress * stem_h as f32) as usize;
+        for i in 0..visible {
+            let y = stem_top + stem_h - 1 - i;
+            if y < h && flower_cx < w {
+                let green = 75 + (i as u8 * 18).min(60);
+                chars[y][flower_cx] = (
+                    '\u{2502}', // │
+                    Style::default().fg(Color::Rgb(40, green, 38)),
+                );
+            }
+        }
+        // Tiny leaves
+        if progress > 0.55 {
+            let ly = stem_top + 1;
+            if ly < h && flower_cx >= 1 {
+                chars[ly][flower_cx - 1] = (
+                    '\u{2572}', // ╲
+                    Style::default().fg(Color::Rgb(45, 115, 45)),
+                );
+            }
+        }
+        if progress > 0.75 {
+            let ly = stem_top;
+            if ly < h && flower_cx + 1 < w {
+                chars[ly][flower_cx + 1] = (
+                    '\u{2571}', // ╱
+                    Style::default().fg(Color::Rgb(45, 125, 48)),
+                );
+            }
+        }
+    }
+
+    // --- Single flower bloom (ticks 10..32) ---
+    if tick >= 10 && flower_cy < h {
+        let bloom_base = ((tick as f32 - 10.0) / 22.0).clamp(0.0, 1.0);
+        let petal_count = 5.0_f32;
+        let pi2 = std::f32::consts::PI * 2.0;
+        let ir = flower_radius.ceil() as i32;
+
+        for dy in -ir..=ir {
+            for dx in (-ir * 2)..=(ir * 2) {
+                let fx = dx as f32 / 2.0; // aspect ratio correction
+                let fy = dy as f32;
+                let dist = (fx * fx + fy * fy).sqrt();
+
+                if dist < 0.3 || dist > flower_radius {
+                    continue;
+                }
+
+                let angle = fy.atan2(fx);
+
+                // Petal shape: 5 rounded lobes with gaps between them
+                let petal_raw = ((angle * petal_count).cos() * 0.5 + 0.5).powf(0.55);
+                let petal_r = flower_radius * (0.3 + petal_raw * 0.7);
+
+                if dist > petal_r {
+                    continue;
+                }
+
+                // Per-petal stagger: each petal unfurls slightly after the previous
+                let petal_idx = ((angle / pi2 * petal_count).rem_euclid(petal_count)) as usize;
+                let stagger = petal_idx as f32 * 0.06;
+                let bloom = (bloom_base - stagger).clamp(0.0, 1.0);
+                let current_r = bloom * petal_r;
+
+                if dist > current_r {
+                    continue;
+                }
+
+                let x = (flower_cx as i32 + dx) as usize;
+                let y = (flower_cy as i32 + dy) as usize;
+                if x >= w || y >= h {
+                    continue;
+                }
+
+                // Soft fade at the bloom edge
+                let edge = ((current_r - dist) / 1.2).clamp(0.0, 1.0);
+
+                // Character and color by distance
+                let (ch, cr, cg, cb) = if dist < 1.2 {
+                    // Warm golden center
+                    ('*', 210u8, 180u8, 75u8)
+                } else if dist < 2.5 {
+                    // Inner petals — soft rose
+                    let c = if petal_raw > 0.7 { '*' } else { '\u{00B7}' };
+                    (c, 195, 130, 145)
+                } else if dist < 3.8 {
+                    // Mid petals — dusty pink
+                    let c = if petal_raw > 0.6 { '\u{00B7}' } else { '.' };
+                    (c, 180, 140, 155)
+                } else {
+                    // Outer wisps — very faint
+                    ('.', 160, 148, 158)
+                };
+
+                let r = (cr as f32 * edge) as u8;
+                let g = (cg as f32 * edge) as u8;
+                let b = (cb as f32 * edge) as u8;
+
+                chars[y][x] = (ch, Style::default().fg(Color::Rgb(r, g, b)));
+            }
+        }
+
+        // Bright center dot, visible as soon as bloom starts
+        if bloom_base > 0.05 && flower_cy < h && flower_cx < w {
+            let b = (bloom_base.min(0.4) / 0.4 * 200.0) as u8;
+            chars[flower_cy][flower_cx] = (
+                '*',
+                Style::default()
+                    .fg(Color::Rgb(b + 40, (b as f32 * 0.85) as u8 + 30, 50))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+
+    // --- Sparkles ---
+    for &(sx, sy, birth, ci) in &state.sparkles {
+        if tick < birth || sx >= w || sy >= h {
+            continue;
+        }
+        let age = tick - birth;
+        let cycle = age % 19;
+        if cycle < 4 {
+            let brightness = match cycle {
+                0 => 35,
+                1 => 70,
+                2 => 60,
+                _ => 30,
+            };
+            if chars[sy][sx].0 == ' ' {
+                chars[sy][sx] = (
+                    SPARKLE_CHARS[ci],
+                    Style::default().fg(Color::Rgb(
+                        brightness + 35,
+                        brightness + 35,
+                        brightness + 55,
+                    )),
+                );
+            }
+        }
+    }
+
+    // --- Logo (tick 18+) ---
+    if tick >= 18 {
+        let logo_progress = ((tick - 18) as f32 / 18.0).min(1.0);
+
+        for (li, &logo_line) in LOGO.iter().enumerate() {
+            let y = logo_top + li;
+            if y >= h {
+                break;
+            }
+            for (ci, ch) in logo_line.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                let x = logo_left + ci;
+                if x >= w {
+                    break;
+                }
+
+                // Bloom from center outward
+                if logo_progress < 1.0 {
+                    let center = logo_w as f32 / 2.0;
+                    let dist = ((ci as f32 - center).abs() / center
+                        + (li as f32 / logo_h as f32) * 0.3)
+                        / 1.3;
+                    if dist > logo_progress {
+                        continue;
+                    }
+                }
+
+                let settle = ((tick as f32 - 18.0) / 30.0).min(1.0);
+                let wave = if tick >= 36 {
+                    let w = (tick as f32 * 0.1 - ci as f32 * 0.05).sin() * 0.5 + 0.5;
+                    w * (1.0 - settle).max(0.12)
+                } else {
+                    0.4
+                };
+                let r = (170.0 - settle * 70.0 + wave * 35.0) as u8;
+                let g = (155.0 + settle * 45.0 + wave * 25.0) as u8;
+                let b = (80.0 + settle * 60.0 + wave * 35.0) as u8;
+
+                chars[y][x] = (
+                    ch,
+                    Style::default()
+                        .fg(Color::Rgb(r, g, b))
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+
+    // --- Welcome message (tick 36+) ---
+    if tick >= 36 {
+        if welcome_y < h {
+            let progress = ((tick - 36) as f32 / 14.0).min(1.0);
+            let visible = (progress * welcome.len() as f32) as usize;
+            let left = w.saturating_sub(welcome.len()) / 2;
+            for (ci, ch) in welcome.chars().take(visible).enumerate() {
+                let x = left + ci;
+                if x < w {
+                    let glow = if ci + 2 >= visible { 200 } else { 165 };
+                    chars[welcome_y][x] = (
+                        ch,
+                        Style::default().fg(Color::Rgb(glow, glow - 25, glow + 10)),
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Hint (tick 48+) ---
+    if tick >= 48 {
+        let hint = "press any key to continue";
+        if hint_y < h {
+            let fade = (((tick - 48) as f32 / 12.0).min(1.0) * 110.0) as u8;
+            let left = w.saturating_sub(hint.len()) / 2;
+            for (ci, ch) in hint.chars().enumerate() {
+                let x = left + ci;
+                if x < w {
+                    chars[hint_y][x] = (
+                        ch,
+                        Style::default().fg(Color::Rgb(fade, fade - 8, fade + 18)),
+                    );
+                }
+            }
+        }
+    }
+
+    // Convert buffer to Lines
+    let lines: Vec<Line> = chars
+        .iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut current_text = String::new();
+            let mut current_style = Style::default();
+            for &(ch, style) in row {
+                if style == current_style {
+                    current_text.push(ch);
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut current_text),
+                            current_style,
+                        ));
+                    }
+                    current_text.push(ch);
+                    current_style = style;
+                }
+            }
+            if !current_text.is_empty() {
+                spans.push(Span::styled(current_text, current_style));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }
 
@@ -306,33 +586,18 @@ fn date_separator(date: chrono::NaiveDate) -> Line<'static> {
     .alignment(Alignment::Center)
 }
 
-/// Convert cached image pixel rows to Lines for rendering using half-block characters.
-fn image_to_lines(rows: &[Vec<(Color, Color)>], sel_bg: Option<Color>) -> Vec<Line<'static>> {
-    rows.iter()
-        .map(|row| {
-            let mut spans: Vec<Span> = Vec::new();
-            spans.push(Span::raw("  ")); // indent
-            for &(fg, bg) in row {
-                let style = Style::default().fg(fg).bg(bg);
-                spans.push(Span::styled("\u{2580}", style)); // ▀
-            }
-            if let Some(bg) = sel_bg {
-                // Extend selection background to rest of line
-                spans.push(Span::styled(" ", Style::default().bg(bg)));
-            }
-            Line::from(spans)
-        })
-        .collect()
-}
+/// Height in terminal rows reserved for an inline image.
+const IMAGE_ROWS: u16 = 15;
 
 /// Build display lines for a message with Slack-style layout.
 /// `show_header` controls whether the author name + time are shown (false for grouped messages).
+/// Returns (lines, image_placeholders) where each placeholder is (line_offset_within_result, file_id).
 fn build_message_lines<'a>(
     msg: &'a crate::types::Message,
     is_selected: bool,
     show_header: bool,
-    image_cache: &HashMap<String, Vec<Vec<(Color, Color)>>>,
-) -> Vec<Line<'a>> {
+    image_cache_keys: &std::collections::HashSet<String>,
+) -> (Vec<Line<'a>>, Vec<(usize, String)>) {
     let sel_bg = if is_selected {
         Some(Color::Rgb(50, 50, 70))
     } else {
@@ -409,19 +674,15 @@ fn build_message_lines<'a>(
         result.push(Line::from(spans));
     }
 
-    // Image files
-    for img in &msg.image_files {
-        if let Some(rows) = image_cache.get(&img.file_id) {
-            result.extend(image_to_lines(rows, sel_bg));
-        } else {
-            // Show placeholder while loading
-            result.push(Line::from(vec![
-                Span::styled("  ", style_with_bg(Style::default())),
-                Span::styled(
-                    format!("[loading image: {}]", img.title),
-                    style_with_bg(Style::default().fg(Color::Rgb(100, 100, 130))),
-                ),
-            ]));
+    // Inline images: insert placeholder blank lines for cached images
+    let mut image_placeholders = Vec::new();
+    for file in &msg.files {
+        if file.is_image && image_cache_keys.contains(&file.file_id) {
+            let offset = result.len();
+            image_placeholders.push((offset, file.file_id.clone()));
+            for _ in 0..IMAGE_ROWS {
+                result.push(Line::default());
+            }
         }
     }
 
@@ -448,7 +709,7 @@ fn build_message_lines<'a>(
         result.push(Line::from(reaction_spans));
     }
 
-    result
+    (result, image_placeholders)
 }
 
 /// Render chat messages with text wrapping, scroll-to-bottom, selection highlighting,
@@ -460,10 +721,16 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Collect cached file IDs for build_message_lines
+    let cached_keys: std::collections::HashSet<String> =
+        app.image_cache.keys().cloned().collect();
+
     // Build display lines for each message, tracking which msg index each line belongs to.
     // msg_line_ranges[i] = (start_line, end_line) in the flat lines vec.
+    // image_positions: (absolute_line, file_id) for images to render after the paragraph.
     let mut all_lines: Vec<Line> = Vec::new();
     let mut msg_line_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut image_positions: Vec<(usize, String)> = Vec::new();
     let mut last_date: Option<chrono::NaiveDate> = None;
 
     for (i, msg) in app.messages.iter().enumerate() {
@@ -493,14 +760,19 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let start = all_lines.len();
-        all_lines.extend(build_message_lines(msg, is_selected, !grouped, &app.image_cache));
+        let (lines, placeholders) = build_message_lines(msg, is_selected, !grouped, &cached_keys);
+        // Map relative placeholder offsets to absolute line positions
+        for (offset, file_id) in placeholders {
+            image_positions.push((start + offset, file_id));
+        }
+        all_lines.extend(lines);
         msg_line_ranges.push((start, all_lines.len()));
     }
 
     let paragraph = Paragraph::new(Text::from(all_lines.clone())).wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width);
 
-    if let Some(sel_idx) = app.selected_message {
+    let scroll_y = if let Some(sel_idx) = app.selected_message {
         // Compute wrapped y positions for the selected message
         let (sel_start_line, sel_end_line) = msg_line_ranges
             .get(sel_idx)
@@ -521,34 +793,56 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         let max_scroll = line_count.saturating_sub(height);
 
         // Keep view stable: only scroll when selected message goes off-screen
-        let scroll_y = if y_start < app.chat_scroll {
-            // Selected message is above viewport — scroll up to show it at top
+        let sy = if y_start < app.chat_scroll {
             y_start
         } else if y_end > app.chat_scroll + height {
-            // Selected message is below viewport — scroll down to show it at bottom
             y_end.saturating_sub(height)
         } else {
-            // Selected message is visible — don't move
             app.chat_scroll.min(max_scroll)
         };
-
-        // Persist scroll position for next frame
-        app.chat_scroll = scroll_y;
-
-        let paragraph = Paragraph::new(Text::from(all_lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y as u16, 0));
-        frame.render_widget(paragraph, area);
+        app.chat_scroll = sy;
+        sy
     } else {
         // No selection: scroll to bottom, with chat_scroll as offset from bottom
         let max_scroll = line_count.saturating_sub(height);
         let clamped_scroll = app.chat_scroll.min(max_scroll);
-        let scroll_y = max_scroll.saturating_sub(clamped_scroll);
+        max_scroll.saturating_sub(clamped_scroll)
+    };
 
-        let paragraph = Paragraph::new(Text::from(all_lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y as u16, 0));
-        frame.render_widget(paragraph, area);
+    let paragraph = Paragraph::new(Text::from(all_lines.clone()))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y as u16, 0));
+    frame.render_widget(paragraph, area);
+
+    // Render images at their placeholder positions using StatefulImage
+    for (abs_line, file_id) in &image_positions {
+        // Compute wrapped y for this placeholder line
+        let img_y = if *abs_line == 0 {
+            0
+        } else {
+            Paragraph::new(Text::from(all_lines[..*abs_line].to_vec()))
+                .wrap(Wrap { trim: false })
+                .line_count(area.width)
+        };
+        // Position relative to viewport
+        let rel_y = img_y as i32 - scroll_y as i32;
+        if rel_y < 0 || rel_y >= height as i32 {
+            continue; // off-screen
+        }
+        let visible_rows = (height as i32 - rel_y).min(IMAGE_ROWS as i32) as u16;
+        if visible_rows == 0 {
+            continue;
+        }
+        let img_area = Rect::new(
+            area.x + 2, // indent
+            area.y + rel_y as u16,
+            area.width.saturating_sub(4),
+            visible_rows,
+        );
+        if let Some(protocol) = app.image_cache.get_mut(file_id) {
+            let image_widget = StatefulImage::default();
+            frame.render_stateful_widget(image_widget, img_area, protocol);
+        }
     }
 }
 
@@ -609,7 +903,7 @@ fn render_input_box(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the thread pane.
-fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
+fn render_threads(frame: &mut Frame, app: &mut App, area: Rect) {
     let bc = border_color(app, Focus::Thread);
     let block = Block::default()
         .title(" Thread ")
@@ -630,7 +924,11 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let cached_keys: std::collections::HashSet<String> =
+        app.image_cache.keys().cloned().collect();
+
     let mut lines: Vec<Line> = Vec::new();
+    let mut image_positions: Vec<(usize, String)> = Vec::new();
     for (i, msg) in app.thread_messages.iter().enumerate() {
         let grouped = if i > 0 {
             should_group(&app.thread_messages[i - 1], msg)
@@ -640,7 +938,12 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
         if !grouped && i > 0 {
             lines.push(Line::default());
         }
-        lines.extend(build_message_lines(msg, false, !grouped, &app.image_cache));
+        let start = lines.len();
+        let (msg_lines, placeholders) = build_message_lines(msg, false, !grouped, &cached_keys);
+        for (offset, file_id) in placeholders {
+            image_positions.push((start + offset, file_id));
+        }
+        lines.extend(msg_lines);
     }
 
     let paragraph = Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
@@ -651,11 +954,40 @@ fn render_threads(frame: &mut Frame, app: &App, area: Rect) {
     let clamped_scroll = app.thread_scroll.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(clamped_scroll) as u16;
 
-    let paragraph = Paragraph::new(Text::from(lines))
+    let paragraph = Paragraph::new(Text::from(lines.clone()))
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
 
     frame.render_widget(paragraph, inner);
+
+    // Render images at their placeholder positions
+    for (abs_line, file_id) in &image_positions {
+        let img_y = if *abs_line == 0 {
+            0
+        } else {
+            Paragraph::new(Text::from(lines[..*abs_line].to_vec()))
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+        };
+        let rel_y = img_y as i32 - scroll_y as i32;
+        if rel_y < 0 || rel_y >= height as i32 {
+            continue;
+        }
+        let visible_rows = (height as i32 - rel_y).min(IMAGE_ROWS as i32) as u16;
+        if visible_rows == 0 {
+            continue;
+        }
+        let img_area = Rect::new(
+            inner.x + 2,
+            inner.y + rel_y as u16,
+            inner.width.saturating_sub(4),
+            visible_rows,
+        );
+        if let Some(protocol) = app.image_cache.get_mut(file_id) {
+            let image_widget = StatefulImage::default();
+            frame.render_stateful_widget(image_widget, img_area, protocol);
+        }
+    }
 }
 
 /// Render the status bar at the bottom.
@@ -709,39 +1041,105 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(&app.search_input),
             Span::styled("\u{258e}", Style::default().fg(Color::Rgb(220, 180, 50))),
         ]),
+        Mode::Upload => Line::from(vec![
+            Span::styled(
+                " UPLOAD ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(180, 120, 220))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" file: ", Style::default().fg(Color::Rgb(180, 120, 220))),
+            Span::raw(&app.upload_path),
+            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(180, 120, 220))),
+            Span::styled(
+                "  Enter=upload, Esc=cancel",
+                Style::default().fg(Color::Rgb(100, 100, 120)),
+            ),
+        ]),
         Mode::Command => {
-            if app.status.is_empty() {
+            let mode_badge = Span::styled(
+                " COMMAND ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(80, 140, 220))
+                    .add_modifier(Modifier::BOLD),
+            );
+            if !app.staged_files.is_empty() {
+                let names: Vec<&str> = app
+                    .staged_files
+                    .iter()
+                    .map(|p| {
+                        std::path::Path::new(p)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(p)
+                    })
+                    .collect();
+                let count = app.staged_files.len();
                 Line::from(vec![
+                    mode_badge,
                     Span::styled(
-                        " COMMAND ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(80, 140, 220))
-                            .add_modifier(Modifier::BOLD),
+                        format!(
+                            " {} file{} staged: {}",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                            names.join(", ")
+                        ),
+                        Style::default().fg(Color::Rgb(180, 120, 220)),
                     ),
+                    Span::styled(" Enter", Style::default().fg(Color::White)),
+                    Span::styled("=upload ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("x", Style::default().fg(Color::White)),
+                    Span::styled("=clear", Style::default().fg(Color::Rgb(100, 100, 120))),
+                ])
+            } else if !app.status.is_empty() {
+                Line::from(vec![
+                    mode_badge,
+                    Span::raw(format!(" {}", &app.status)),
+                ])
+            } else if app.focus == Focus::Chat && app.selected_message.is_some() {
+                // Contextual hints for selected message
+                let msg = app.selected_message.and_then(|i| app.messages.get(i));
+                let has_file = msg.map_or(false, |m| !m.files.is_empty());
+                let has_replies = msg.map_or(false, |m| m.reply_count > 0 || !m.thread.is_empty());
+                let mut spans = vec![mode_badge];
+                spans.push(Span::styled(" i", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=insert ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("r", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=reply ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("e", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=react ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                if has_replies {
+                    spans.push(Span::styled("'", Style::default().fg(Color::White)));
+                    spans.push(Span::styled("=thread ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                }
+                if has_file {
+                    spans.push(Span::styled("o", Style::default().fg(Color::Rgb(100, 200, 140))));
+                    spans.push(Span::styled("=open file ", Style::default().fg(Color::Rgb(100, 200, 140))));
+                }
+                spans.push(Span::styled("u", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=upload ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("j/k", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=nav ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("h", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=back", Style::default().fg(Color::Rgb(100, 100, 120))));
+                Line::from(spans)
+            } else {
+                Line::from(vec![
+                    mode_badge,
                     Span::styled(" i", Style::default().fg(Color::White)),
                     Span::styled("=insert ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("/", Style::default().fg(Color::White)),
                     Span::styled("=search ", Style::default().fg(Color::Rgb(100, 100, 120))),
-                    Span::styled("q", Style::default().fg(Color::White)),
-                    Span::styled("=quit ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("j/k", Style::default().fg(Color::White)),
                     Span::styled("=nav ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("l/h", Style::default().fg(Color::White)),
                     Span::styled("=focus ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("'", Style::default().fg(Color::White)),
-                    Span::styled("=thread", Style::default().fg(Color::Rgb(100, 100, 120))),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(
-                        " COMMAND ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(80, 140, 220))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" {}", &app.status)),
+                    Span::styled("=thread ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("q", Style::default().fg(Color::White)),
+                    Span::styled("=quit", Style::default().fg(Color::Rgb(100, 100, 120))),
                 ])
             }
         }

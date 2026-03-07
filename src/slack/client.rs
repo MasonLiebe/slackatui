@@ -458,6 +458,58 @@ impl SlackClient {
             .map_err(|e| SlackError::Http(e.to_string()))
     }
 
+    // ---- file upload ----
+
+    /// Step 1: Get an external upload URL from Slack.
+    pub async fn get_upload_url(
+        &self,
+        filename: &str,
+        length: u64,
+    ) -> Result<UploadUrlResponse, SlackError> {
+        self.get(
+            "files.getUploadURLExternal",
+            &[
+                ("filename", filename),
+                ("length", &length.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// Step 2: Upload file bytes to the external upload URL.
+    pub async fn upload_to_url(&self, upload_url: &str, data: Vec<u8>) -> Result<(), SlackError> {
+        let resp = self
+            .http
+            .post(upload_url)
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| SlackError::Http(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(SlackError::Http(format!("Upload HTTP {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Step 3: Complete the upload and share to a channel.
+    pub async fn complete_upload(
+        &self,
+        file_id: &str,
+        title: &str,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<CompleteUploadResponse, SlackError> {
+        let mut body = serde_json::json!({
+            "files": [{"id": file_id, "title": title}],
+            "channel_id": channel_id,
+        });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+        self.post_json("files.completeUploadExternal", &body).await
+    }
+
     // ---- rtm.connect ----
 
     /// Get the WebSocket URL for an RTM connection.
@@ -532,6 +584,22 @@ struct BotInfoResponse {
 pub struct BotInfo {
     pub id: String,
     pub name: String,
+}
+
+/// Response from files.getUploadURLExternal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadUrlResponse {
+    #[allow(dead_code)]
+    ok: bool,
+    pub upload_url: String,
+    pub file_id: String,
+}
+
+/// Response from files.completeUploadExternal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompleteUploadResponse {
+    #[allow(dead_code)]
+    ok: bool,
 }
 
 /// Response from rtm.connect.
