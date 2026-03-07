@@ -8,7 +8,7 @@ use std::process::Command;
 const KEYCHAIN_SERVICE: &str = "slackatui";
 
 /// Persisted tokens for a workspace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredTokens {
     #[serde(default)]
     pub bot_token: String,
