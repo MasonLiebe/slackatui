@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod slack;
 mod types;
 
 use config::Config;
