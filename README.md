@@ -35,10 +35,17 @@ cd slackatui
 cargo build --release
 ```
 
-The binary will be at `target/release/slackatui`. You can copy it to your PATH:
+The binary will be at `target/release/slackatui`. You can add it to your PATH:
 
 ```sh
-cp target/release/slackatui /usr/local/bin/
+# Option 1: copy to a system-wide location (requires sudo)
+sudo cp target/release/slackatui /usr/local/bin/
+
+# Option 2: copy to a user-local bin directory (no sudo needed)
+mkdir -p ~/.local/bin
+cp target/release/slackatui ~/.local/bin/
+# Make sure ~/.local/bin is in your PATH — add this to ~/.zshrc or ~/.bashrc:
+# export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### 3. Create a Slack App
