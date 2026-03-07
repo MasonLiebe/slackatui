@@ -158,6 +158,28 @@ impl SlackService {
         msg
     }
 
+    /// Resolve a display name from user/bot/username fields (used by RTM handler).
+    pub fn resolve_user_or_bot(&self, user_id: &str, bot_id: &str, username: &str) -> String {
+        if !user_id.is_empty() {
+            return self
+                .user_cache
+                .get(user_id)
+                .cloned()
+                .unwrap_or_else(|| user_id.to_string());
+        }
+        if !username.is_empty() {
+            return username.to_string();
+        }
+        if !bot_id.is_empty() {
+            return self
+                .user_cache
+                .get(bot_id)
+                .cloned()
+                .unwrap_or_else(|| bot_id.to_string());
+        }
+        "unknown".to_string()
+    }
+
     /// Resolve the author name for a message, checking user cache and bot info.
     fn resolve_message_author(&self, sm: &SlackMessage) -> String {
         if !sm.user.is_empty() {

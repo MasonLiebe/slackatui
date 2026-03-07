@@ -8,8 +8,11 @@ use crossterm::{
 use ratatui::prelude::*;
 use std::io::{self, stdout};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::service::SlackService;
+use crate::slack::rtm::{self, RtmEvent};
 use crate::types::{ChannelItem, Focus, Message, Mode};
 
 /// Application state shared across all TUI components.
@@ -184,18 +187,57 @@ impl App {
     }
 }
 
-/// Initialize the terminal, run the app loop, then restore the terminal.
-pub fn run(config: Config) -> io::Result<()> {
+/// Async entry point: initialize service, load channels, start RTM, run TUI.
+pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> {
+    // Initialize service (auth test + user cache)
+    svc.init().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    let mut app = App::new(config);
+    app.status = "Loading channels...".to_string();
+
+    // Load channels
+    match svc.get_channels().await {
+        Ok(channels) => {
+            app.channels = channels;
+            app.status.clear();
+        }
+        Err(e) => {
+            app.status = format!("Error loading channels: {}", e);
+        }
+    }
+
+    // Load initial messages for the first channel
+    if let Some(ch) = app.current_channel() {
+        let ch_id = ch.id.clone();
+        match svc.get_messages(&ch_id, 50).await {
+            Ok(msgs) => app.messages = msgs,
+            Err(e) => app.status = format!("Error loading messages: {}", e),
+        }
+    }
+
+    // Start RTM connection
+    let rtm_client = crate::slack::SlackClient::new(&svc.client.token());
+    let mut rtm_rx = rtm::start_rtm(rtm_client);
+
+    // Create a channel for async actions triggered by key events
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AsyncAction>();
+
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config);
-
     // Main loop
-    let result = main_loop(&mut terminal, &mut app);
+    let result = async_main_loop(
+        &mut terminal,
+        &mut app,
+        &mut svc,
+        &mut rtm_rx,
+        &action_tx,
+        &mut action_rx,
+    )
+    .await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -204,17 +246,45 @@ pub fn run(config: Config) -> io::Result<()> {
     result
 }
 
-/// The main event loop: render, poll for input, handle events.
-fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+/// Actions that need async processing (sent from key handler to main loop).
+enum AsyncAction {
+    SendMessage { text: String },
+    SelectChannel { index: usize },
+}
+
+/// The async main event loop: render, poll for keyboard + RTM events.
+async fn async_main_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    svc: &mut SlackService,
+    rtm_rx: &mut mpsc::UnboundedReceiver<RtmEvent>,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+    action_rx: &mut mpsc::UnboundedReceiver<AsyncAction>,
+) -> io::Result<()> {
     while app.running {
         terminal.draw(|frame| {
             layout::render(frame, app);
         })?;
 
-        // Poll for events with a 100ms timeout
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(app, key.code, key.modifiers);
+        // Use tokio::select to handle keyboard events, RTM events, and async actions
+        tokio::select! {
+            // Check for keyboard events (non-blocking poll)
+            _ = tokio::task::yield_now() => {
+                if event::poll(Duration::from_millis(50))? {
+                    if let Event::Key(key) = event::read()? {
+                        handle_key_async(app, key.code, key.modifiers, action_tx);
+                    }
+                }
+            }
+
+            // RTM events from the WebSocket
+            Some(rtm_event) = rtm_rx.recv() => {
+                handle_rtm_event(app, svc, rtm_event).await;
+            }
+
+            // Async actions from key handlers
+            Some(action) = action_rx.recv() => {
+                handle_async_action(app, svc, action).await;
             }
         }
     }
@@ -222,21 +292,145 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
     Ok(())
 }
 
-/// Convert a crossterm KeyCode + modifiers into a config key string,
-/// look it up in the current mode's keymap, and dispatch the action.
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+/// Handle an RTM event: update app state with new messages, presence changes.
+async fn handle_rtm_event(app: &mut App, svc: &mut SlackService, event: RtmEvent) {
+    match event {
+        RtmEvent::Message(msg_event) => {
+            let current_channel_id = app
+                .current_channel()
+                .map(|ch| ch.id.clone())
+                .unwrap_or_default();
+
+            match msg_event.sub_type.as_str() {
+                "" => {
+                    // Regular message
+                    if msg_event.channel == current_channel_id {
+                        let name = svc.resolve_user_or_bot(&msg_event.user, &msg_event.bot_id, &msg_event.username);
+                        let content = crate::parse::parse_message(
+                            &msg_event.text,
+                            svc.emoji_enabled,
+                            &svc.user_cache,
+                        );
+                        let time = crate::service::parse_slack_timestamp(&msg_event.ts);
+                        let mut message = Message::new(msg_event.ts.clone(), name, content, time);
+                        message.id = crate::parse::hash_id(&msg_event.ts);
+
+                        if !msg_event.thread_ts.is_empty() && msg_event.thread_ts != msg_event.ts {
+                            message.thread = crate::parse::hash_id(&msg_event.thread_ts);
+                        }
+
+                        app.messages.push(message);
+                        app.chat_scroll = 0; // Scroll to bottom on new message
+                    }
+
+                    // Update notification for other channels
+                    if msg_event.channel != current_channel_id {
+                        for ch in &mut app.channels {
+                            if ch.id == msg_event.channel {
+                                ch.notification = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                "message_changed" => {
+                    if msg_event.channel == current_channel_id {
+                        if let Some(sub) = &msg_event.message {
+                            for m in &mut app.messages {
+                                if m.id == crate::parse::hash_id(&sub.ts) {
+                                    m.content = crate::parse::parse_message(
+                                        &sub.text,
+                                        svc.emoji_enabled,
+                                        &svc.user_cache,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        RtmEvent::PresenceChange(ev) => {
+            for ch in &mut app.channels {
+                if ch.user_id == ev.user {
+                    ch.presence = ev.presence.clone();
+                }
+            }
+        }
+        RtmEvent::Connected => {
+            app.status = "Connected".to_string();
+        }
+        RtmEvent::Disconnected => {
+            app.status = "Disconnected, reconnecting...".to_string();
+        }
+        RtmEvent::Error(msg) => {
+            app.status = format!("RTM error: {}", msg);
+        }
+    }
+}
+
+/// Handle async actions triggered by key events.
+async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: AsyncAction) {
+    match action {
+        AsyncAction::SendMessage { text } => {
+            if let Some(ch) = app.current_channel() {
+                let ch_id = ch.id.clone();
+                // Determine if we're in a thread
+                let thread_ts = if app.focus == Focus::Thread && !app.thread_messages.is_empty() {
+                    // Find the thread parent ts
+                    app.thread_messages.first().map(|m| {
+                        // The first message in thread_messages is the parent
+                        // We need the original timestamp, not the hash
+                        m.id.clone()
+                    })
+                } else {
+                    None
+                };
+
+                if let Err(e) = svc.send(&ch_id, &text, thread_ts.as_deref()).await {
+                    app.status = format!("Send error: {}", e);
+                }
+            }
+        }
+        AsyncAction::SelectChannel { index } => {
+            if index < app.channels.len() {
+                app.selected_channel = index;
+                app.messages.clear();
+                app.chat_scroll = 0;
+                app.thread_messages.clear();
+                app.thread_visible = false;
+
+                let ch_id = app.channels[index].id.clone();
+                app.channels[index].notification = false;
+
+                match svc.get_messages(&ch_id, 50).await {
+                    Ok(msgs) => app.messages = msgs,
+                    Err(e) => app.status = format!("Error: {}", e),
+                }
+            }
+        }
+    }
+}
+
+/// Key handler that can trigger async actions via the action channel.
+fn handle_key_async(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
     let key_str = key_to_string(code, modifiers);
 
-    // In insert/search mode, printable characters that aren't mapped go to input
     match app.mode {
         Mode::Insert => {
             if let Some(keymap) = app.current_keymap() {
                 if let Some(action) = keymap.get(&key_str) {
-                    dispatch_action(app, action.clone());
+                    dispatch_action(app, action.clone(), action_tx);
                     return;
                 }
             }
-            // Unmapped key in insert mode: type the character
             if let KeyCode::Char(c) = code {
                 app.input_char(c);
             }
@@ -244,7 +438,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         Mode::Search => {
             if let Some(keymap) = app.current_keymap() {
                 if let Some(action) = keymap.get(&key_str) {
-                    dispatch_action(app, action.clone());
+                    dispatch_action(app, action.clone(), action_tx);
                     return;
                 }
             }
@@ -255,7 +449,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         Mode::Command => {
             if let Some(keymap) = app.current_keymap() {
                 if let Some(action) = keymap.get(&key_str) {
-                    dispatch_action(app, action.clone());
+                    dispatch_action(app, action.clone(), action_tx);
                 }
             }
         }
@@ -263,7 +457,11 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 }
 
 /// Dispatch a named action from the keymap.
-fn dispatch_action(app: &mut App, action: String) {
+fn dispatch_action(
+    app: &mut App,
+    action: String,
+    action_tx: &mpsc::UnboundedSender<AsyncAction>,
+) {
     match action.as_str() {
         // Mode switching
         "mode-insert" => {
@@ -280,11 +478,35 @@ fn dispatch_action(app: &mut App, action: String) {
             app.status = "/".to_string();
         }
 
-        // Channel navigation
-        "channel-up" => app.channel_up(),
-        "channel-down" => app.channel_down(),
-        "channel-top" => app.channel_top(),
-        "channel-bottom" => app.channel_bottom(),
+        // Channel navigation (triggers async channel load)
+        "channel-up" => {
+            let prev = app.selected_channel;
+            app.channel_up();
+            if app.selected_channel != prev {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            }
+        }
+        "channel-down" => {
+            let prev = app.selected_channel;
+            app.channel_down();
+            if app.selected_channel != prev {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            }
+        }
+        "channel-top" => {
+            let prev = app.selected_channel;
+            app.channel_top();
+            if app.selected_channel != prev {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            }
+        }
+        "channel-bottom" => {
+            let prev = app.selected_channel;
+            app.channel_bottom();
+            if app.selected_channel != prev {
+                let _ = action_tx.send(AsyncAction::SelectChannel { index: app.selected_channel });
+            }
+        }
 
         // Chat scrolling
         "chat-up" => app.chat_up(),
@@ -319,9 +541,12 @@ fn dispatch_action(app: &mut App, action: String) {
             }
         }
 
-        // Send message (placeholder — will be wired in commit 14)
+        // Send message
         "send" => {
-            let _msg = app.take_input();
+            let text = app.take_input();
+            if !text.is_empty() {
+                let _ = action_tx.send(AsyncAction::SendMessage { text });
+            }
             app.mode = Mode::Command;
             app.status.clear();
         }
@@ -387,6 +612,11 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default())
+    }
+
+    fn test_action_tx() -> mpsc::UnboundedSender<AsyncAction> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tx
     }
 
     #[test]
@@ -546,35 +776,38 @@ mod tests {
     #[test]
     fn test_dispatch_mode_switching() {
         let mut app = test_app();
+        let tx = test_action_tx();
 
-        dispatch_action(&mut app, "mode-insert".to_string());
+        dispatch_action(&mut app, "mode-insert".to_string(), &tx);
         assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.status, "-- INSERT --");
 
-        dispatch_action(&mut app, "mode-command".to_string());
+        dispatch_action(&mut app, "mode-command".to_string(), &tx);
         assert_eq!(app.mode, Mode::Command);
         assert!(app.status.is_empty());
 
-        dispatch_action(&mut app, "mode-search".to_string());
+        dispatch_action(&mut app, "mode-search".to_string(), &tx);
         assert_eq!(app.mode, Mode::Search);
     }
 
     #[test]
     fn test_dispatch_quit() {
         let mut app = test_app();
+        let tx = test_action_tx();
         assert!(app.running);
-        dispatch_action(&mut app, "quit".to_string());
+        dispatch_action(&mut app, "quit".to_string(), &tx);
         assert!(!app.running);
     }
 
     #[test]
     fn test_dispatch_send() {
         let mut app = test_app();
+        let tx = test_action_tx();
         app.mode = Mode::Insert;
         app.input = "hello world".to_string();
         app.cursor_pos = 11;
 
-        dispatch_action(&mut app, "send".to_string());
+        dispatch_action(&mut app, "send".to_string(), &tx);
         assert!(app.input.is_empty());
         assert_eq!(app.mode, Mode::Command);
     }
@@ -626,41 +859,45 @@ mod tests {
     #[test]
     fn test_handle_key_command_mode() {
         let mut app = test_app();
+        let tx = test_action_tx();
         app.mode = Mode::Command;
 
-        handle_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        handle_key_async(&mut app, KeyCode::Char('i'), KeyModifiers::NONE, &tx);
         assert_eq!(app.mode, Mode::Insert);
     }
 
     #[test]
     fn test_handle_key_insert_mode_typing() {
         let mut app = test_app();
+        let tx = test_action_tx();
         app.mode = Mode::Insert;
 
-        handle_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
-        handle_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        handle_key_async(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &tx);
+        handle_key_async(&mut app, KeyCode::Char('i'), KeyModifiers::NONE, &tx);
         assert_eq!(app.input, "hi");
     }
 
     #[test]
     fn test_handle_key_insert_escape() {
         let mut app = test_app();
+        let tx = test_action_tx();
         app.mode = Mode::Insert;
 
-        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_async(&mut app, KeyCode::Esc, KeyModifiers::NONE, &tx);
         assert_eq!(app.mode, Mode::Command);
     }
 
     #[test]
     fn test_handle_key_search_mode() {
         let mut app = test_app();
+        let tx = test_action_tx();
         app.mode = Mode::Search;
 
-        handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
-        handle_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        handle_key_async(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &tx);
+        handle_key_async(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &tx);
         assert_eq!(app.search_input, "te");
 
-        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_async(&mut app, KeyCode::Esc, KeyModifiers::NONE, &tx);
         assert_eq!(app.mode, Mode::Command);
         assert!(app.search_input.is_empty());
     }

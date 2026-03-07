@@ -37,6 +37,11 @@ impl SlackClient {
         }
     }
 
+    /// Return the token (used for creating RTM client clone).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Generic helper for GET requests to the Slack API.
     async fn get<T: serde::de::DeserializeOwned>(
         &self,
