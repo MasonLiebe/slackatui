@@ -372,6 +372,13 @@ impl SlackClient {
             .await?;
         Ok(())
     }
+
+    // ---- rtm.connect ----
+
+    /// Get the WebSocket URL for an RTM connection.
+    pub async fn rtm_connect(&self) -> Result<RtmConnectResponse, SlackError> {
+        self.post_form("rtm.connect", &[]).await
+    }
 }
 
 // ---- Response types ----
@@ -440,6 +447,14 @@ struct BotInfoResponse {
 pub struct BotInfo {
     pub id: String,
     pub name: String,
+}
+
+/// Response from rtm.connect.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RtmConnectResponse {
+    #[allow(dead_code)]
+    ok: bool,
+    pub url: String,
 }
 
 /// Response from chat.postMessage.
