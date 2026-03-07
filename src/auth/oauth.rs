@@ -2,8 +2,10 @@ use chrono::Utc;
 use rand::RngCore;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_rustls::TlsAcceptor;
 
 use super::StoredTokens;
 
@@ -201,8 +203,42 @@ pub fn parse_token_response(resp: &TokenResponse) -> StoredTokens {
     tokens
 }
 
+/// Generate a self-signed TLS certificate for localhost.
+fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), OAuthError> {
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+        .map_err(|e| OAuthError::ServerFailed(format!("TLS cert generation failed: {}", e)))?;
+    let cert_pem = certified_key
+        .cert
+        .pem()
+        .into_bytes();
+    let key_pem = certified_key
+        .key_pair
+        .serialize_pem()
+        .into_bytes();
+    Ok((cert_pem, key_pem))
+}
+
+/// Build a TLS acceptor from PEM-encoded cert and key.
+fn build_tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor, OAuthError> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &*cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| OAuthError::ServerFailed(format!("cert parse error: {}", e)))?;
+
+    let key = rustls_pemfile::private_key(&mut &*key_pem)
+        .map_err(|e| OAuthError::ServerFailed(format!("key parse error: {}", e)))?
+        .ok_or_else(|| OAuthError::ServerFailed("no private key found".to_string()))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| OAuthError::ServerFailed(format!("TLS config error: {}", e)))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Run the complete OAuth v2 authorization flow:
-/// 1. Start a local HTTP callback server on 127.0.0.1
+/// 1. Start a local HTTPS callback server on 127.0.0.1 (self-signed cert)
 /// 2. Open the authorization URL in the default browser
 /// 3. Wait for the callback with an authorization code
 /// 4. Exchange the code for access tokens
@@ -212,6 +248,10 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
     if cfg.user_scopes.is_empty() && cfg.scopes.is_empty() {
         cfg.user_scopes = DEFAULT_USER_SCOPES.iter().map(|s| s.to_string()).collect();
     }
+
+    // Generate self-signed TLS cert for localhost
+    let (cert_pem, key_pem) = generate_self_signed_cert()?;
+    let tls_acceptor = build_tls_acceptor(&cert_pem, &key_pem)?;
 
     // Bind callback server
     let addr: SocketAddr = format!("127.0.0.1:{}", cfg.port)
@@ -228,7 +268,7 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
         .port();
 
     if cfg.redirect_uri.is_empty() {
-        cfg.redirect_uri = format!("http://127.0.0.1:{}/callback", port);
+        cfg.redirect_uri = format!("https://localhost:{}/callback", port);
     }
 
     let auth_url = build_authorize_url(cfg, &state);
@@ -239,6 +279,7 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
         auth_url
     );
     println!("Waiting for authorization callback...");
+    println!("(Your browser may show a certificate warning — this is expected for the local self-signed cert. Click \"Advanced\" and proceed.)");
 
     let _ = open::that(&auth_url);
 
@@ -250,7 +291,7 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
     // Spawn the callback server
     let server_handle = tokio::spawn(async move {
         // Accept exactly one connection
-        let (stream, _) = match listener.accept().await {
+        let (tcp_stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 if let Some(tx) = tx.lock().unwrap().take() {
@@ -260,7 +301,18 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
             }
         };
 
-        let io = hyper_util::rt::TokioIo::new(stream);
+        // TLS handshake
+        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(Err(OAuthError::ServerFailed(format!("TLS handshake failed: {}", e))));
+                }
+                return;
+            }
+        };
+
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
         let state = state_clone.clone();
         let tx_ref = &tx;
 

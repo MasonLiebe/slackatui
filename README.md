@@ -47,7 +47,7 @@ You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.sla
 
 1. **Name your app** (e.g. "slackatui") and select your workspace
 2. Go to **OAuth & Permissions** in the sidebar
-3. Under **Redirect URLs**, add: `http://localhost:8888`
+3. Under **Redirect URLs**, add: `https://localhost:8888`
 4. Under **User Token Scopes**, add these scopes:
    - `channels:read`, `channels:history`, `channels:write`
    - `groups:read`, `groups:history`, `groups:write`
@@ -78,7 +78,7 @@ Set your Client ID and redirect URI in the config JSON:
 {
   "auth": {
     "client_id": "YOUR_CLIENT_ID_HERE",
-    "redirect_uri": "http://localhost:8888",
+    "redirect_uri": "https://localhost:8888",
     "token_store": "keychain",
     "token_preference": "user"
   },
@@ -91,7 +91,7 @@ Set your Client ID and redirect URI in the config JSON:
 | Field | Description |
 |---|---|
 | `auth.client_id` | Your Slack App's Client ID (from step 3) |
-| `auth.redirect_uri` | Must match what you set in the Slack App (`http://localhost:8888`) |
+| `auth.redirect_uri` | Must match what you set in the Slack App (`https://localhost:8888`) |
 | `auth.token_store` | `"keychain"` (macOS Keychain) or `"file"` (JSON at `~/.config/slackatui/tokens.json`) |
 | `auth.token_preference` | `"user"` (recommended) or `"bot"` |
 | `auth.team_id` | Optional. Set to target a specific workspace if you have multiple |
@@ -106,10 +106,12 @@ slackatui auth
 ```
 
 This will:
-1. Start a local server on port 8888
-2. Open your browser to Slack's OAuth page
-3. After you approve, Slack redirects back to localhost
-4. Your token is saved to Keychain (or file, based on config)
+1. Generate a self-signed TLS certificate for localhost
+2. Start a local HTTPS server on port 8888
+3. Open your browser to Slack's OAuth page
+4. After you approve, Slack redirects back to `https://localhost:8888`
+5. Your browser may show a certificate warning — click **Advanced** > **Proceed** (this is expected for the self-signed cert)
+6. Your token is saved to Keychain (or file, based on config)
 
 You should see:
 ```
@@ -166,7 +168,9 @@ slackatui
 
 **"auth.client_id is not set"** — Edit `~/.config/slackatui/config` and add your Slack App's Client ID.
 
-**OAuth flow hangs** — Make sure port 8888 is free and your redirect URI matches exactly (`http://localhost:8888`).
+**OAuth flow hangs** — Make sure port 8888 is free and your redirect URI matches exactly (`https://localhost:8888`).
+
+**Browser shows certificate warning** — This is expected. The auth flow uses a self-signed TLS certificate for the local callback server. Click "Advanced" and "Proceed to localhost" to complete the flow.
 
 **"invalid_auth" or "not_authed"** — Your token may have expired. Re-run `slackatui auth`.
 
