@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod parse;
+mod service;
 mod slack;
 mod tui;
 mod types;
