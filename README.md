@@ -66,17 +66,17 @@ You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.sla
 
 ### 4. Configure slackatui
 
-Run `slackatui` once to generate a default config file, then edit it:
+Run `slackatui` once — it will fail but create a default config file. Then edit it:
 
 ```sh
-# Generate default config
+# Generate default config (will print an error, that's OK)
 slackatui
 
-# Edit the config (macOS)
-open ~/.config/slackatui/config
+# Edit the config (macOS — config lives in ~/Library/Application Support/)
+$EDITOR ~/Library/Application\ Support/slackatui/config
 
-# Or with your editor
-$EDITOR ~/.config/slackatui/config
+# On Linux the config is at:
+# $EDITOR ~/.config/slackatui/config
 ```
 
 Set your Client ID and redirect URI in the config JSON:
@@ -173,7 +173,7 @@ slackatui
 
 **"No stored tokens found"** — Run `slackatui auth` first.
 
-**"auth.client_id is not set"** — Edit `~/.config/slackatui/config` and add your Slack App's Client ID.
+**"auth.client_id is not set"** — Edit your config file and add your Slack App's Client ID. On macOS the path is `~/Library/Application Support/slackatui/config`. On Linux it's `~/.config/slackatui/config`.
 
 **OAuth flow hangs** — Make sure port 8888 is free and your redirect URI matches exactly (`https://localhost:8888`).
 
