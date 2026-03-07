@@ -237,11 +237,61 @@ fn build_tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor, OA
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Handle a single TLS connection: accept, handshake, serve one HTTP request.
+/// Returns the HTTP request URI path so the caller can decide what happened.
+async fn serve_one_tls_request(
+    listener: &TcpListener,
+    tls_acceptor: &TlsAcceptor,
+    response_body: String,
+) -> Result<String, OAuthError> {
+    let (tcp_stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| OAuthError::ServerFailed(e.to_string()))?;
+
+    let tls_stream = tls_acceptor
+        .accept(tcp_stream)
+        .await
+        .map_err(|e| OAuthError::ServerFailed(format!("TLS handshake failed: {}", e)))?;
+
+    let io = hyper_util::rt::TokioIo::new(tls_stream);
+
+    let (uri_tx, uri_rx) = oneshot::channel::<String>();
+    let uri_tx = std::sync::Mutex::new(Some(uri_tx));
+    let body = response_body.clone();
+
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let uri = req.uri().to_string();
+        if let Some(tx) = uri_tx.lock().unwrap().take() {
+            let _ = tx.send(uri);
+        }
+        let body = body.clone();
+        async move {
+            Ok::<_, hyper::Error>(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "text/html")
+                    .body(full_body(&body))
+                    .unwrap(),
+            )
+        }
+    });
+
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await;
+
+    uri_rx
+        .await
+        .map_err(|_| OAuthError::ServerFailed("connection closed before request".to_string()))
+}
+
 /// Run the complete OAuth v2 authorization flow:
-/// 1. Start a local HTTPS callback server on 127.0.0.1 (self-signed cert)
-/// 2. Open the authorization URL in the default browser
-/// 3. Wait for the callback with an authorization code
-/// 4. Exchange the code for access tokens
+/// 1. Start a local HTTPS callback server with a self-signed cert
+/// 2. Open the browser to https://localhost first so the user accepts the cert
+/// 3. That page auto-redirects to Slack's OAuth authorize URL
+/// 4. Slack redirects back to https://localhost with the auth code (cert already trusted)
+/// 5. Exchange the code for access tokens
 pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAuthError> {
     let state = generate_state()?;
 
@@ -273,98 +323,63 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
 
     let auth_url = build_authorize_url(cfg, &state);
 
+    // Step 1: Open browser to our local HTTPS server.
+    // The user will see a certificate warning and click through it.
+    // Our server responds with a page that auto-redirects to Slack's OAuth URL.
+    let local_url = format!("https://localhost:{}/start", port);
+
     println!("\nOpening browser for Slack authorization...");
+    println!("\nYour browser will show a certificate warning for localhost.");
+    println!("This is expected — click \"Advanced\" then \"Proceed to localhost\" to continue.\n");
     println!(
-        "\nIf the browser doesn't open automatically, visit this URL:\n\n  {}\n",
-        auth_url
+        "If the browser doesn't open, visit:\n  {}\n",
+        local_url
     );
-    println!("Waiting for authorization callback...");
-    println!("(Your browser may show a certificate warning — this is expected for the local self-signed cert. Click \"Advanced\" and proceed.)");
 
-    let _ = open::that(&auth_url);
+    let _ = open::that(&local_url);
 
-    // Channel to receive the auth code from the callback handler
-    let (tx, rx) = oneshot::channel::<Result<String, OAuthError>>();
-    let tx = std::sync::Mutex::new(Some(tx));
-    let state_clone = state.clone();
+    // Step 2: Serve the redirect page (first connection — user accepting the cert)
+    let redirect_html = format!(
+        "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head>\
+         <body><p>Redirecting to Slack... <a href=\"{}\">Click here</a> if not redirected.</p></body></html>",
+        auth_url, auth_url
+    );
 
-    // Spawn the callback server
-    let server_handle = tokio::spawn(async move {
-        // Accept exactly one connection
-        let (tcp_stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(Err(OAuthError::ServerFailed(e.to_string())));
+    // Serve the redirect page. The browser may make multiple requests (favicon, etc.)
+    // so we loop until we get the callback with the auth code.
+    let code = tokio::select! {
+        result = async {
+            // Serve the initial redirect page
+            let _ = serve_one_tls_request(&listener, &tls_acceptor, redirect_html.clone()).await;
+
+            println!("Waiting for Slack authorization...");
+
+            // Now wait for the OAuth callback (and handle any intermediate requests)
+            loop {
+                let success_html = "<html><body><h2>Authorization successful!</h2>\
+                    <p>You can close this tab and return to the terminal.</p></body></html>"
+                    .to_string();
+
+                match serve_one_tls_request(&listener, &tls_acceptor, success_html).await {
+                    Ok(uri) => {
+                        match handle_callback(&uri, &state) {
+                            Ok(code) => return Ok(code),
+                            Err(OAuthError::Denied(msg)) => return Err(OAuthError::Denied(msg)),
+                            Err(OAuthError::StateMismatch) => {
+                                // Could be a favicon or other request, keep waiting
+                                continue;
+                            }
+                            Err(_) => continue, // keep waiting for the real callback
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
-                return;
             }
-        };
-
-        // TLS handshake
-        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(Err(OAuthError::ServerFailed(format!("TLS handshake failed: {}", e))));
-                }
-                return;
-            }
-        };
-
-        let io = hyper_util::rt::TokioIo::new(tls_stream);
-        let state = state_clone.clone();
-        let tx_ref = &tx;
-
-        let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let state = state.clone();
-            let result = handle_callback(&req.uri().to_string(), &state);
-            let response = match &result {
-                Ok(_) => hyper::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/html")
-                    .body(full_body("<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>"))
-                    .unwrap(),
-                Err(OAuthError::Denied(msg)) => hyper::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/html")
-                    .body(full_body(&format!("<html><body><h2>Authorization denied</h2><p>{}</p><p>You can close this tab.</p></body></html>", msg)))
-                    .unwrap(),
-                Err(_) => hyper::Response::builder()
-                    .status(400)
-                    .header("Content-Type", "text/plain")
-                    .body(full_body("Bad request"))
-                    .unwrap(),
-            };
-
-            if let Some(tx) = tx_ref.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-
-            async move { Ok::<_, hyper::Error>(response) }
-        });
-
-        let _ = hyper::server::conn::http1::Builder::new()
-            .serve_connection(io, service)
-            .await;
-    });
-
-    // Wait for callback or timeout
-    let result = tokio::select! {
-        result = rx => {
-            match result {
-                Ok(inner) => inner,
-                Err(_) => Err(OAuthError::ServerFailed("callback channel closed".to_string())),
-            }
-        }
+        } => result,
         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
             Err(OAuthError::Timeout)
         }
-    };
-
-    server_handle.abort();
-
-    let code = result?;
+    }?;
 
     println!("Exchanging authorization code for tokens...");
     exchange_code(cfg, &code).await

@@ -113,11 +113,11 @@ slackatui auth
 ```
 
 This will:
-1. Generate a self-signed TLS certificate for localhost
-2. Start a local HTTPS server on port 8888
-3. Open your browser to Slack's OAuth page
-4. After you approve, Slack redirects back to `https://localhost:8888`
-5. Your browser may show a certificate warning — click **Advanced** > **Proceed** (this is expected for the self-signed cert)
+1. Start a local HTTPS server on port 8888 (with a self-signed cert)
+2. Open your browser to `https://localhost:8888`
+3. Your browser will show a certificate warning — click **Advanced** > **Proceed to localhost** (this is normal for the self-signed cert)
+4. The page auto-redirects to Slack's OAuth authorization page
+5. After you approve, Slack redirects back to `https://localhost:8888` (cert already accepted)
 6. Your token is saved to Keychain (or file, based on config)
 
 You should see:
