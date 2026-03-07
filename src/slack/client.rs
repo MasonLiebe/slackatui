@@ -310,6 +310,68 @@ impl SlackClient {
             .await?;
         Ok(())
     }
+
+    // ---- chat.postMessage ----
+
+    /// Send a message to a channel.
+    pub async fn send_message(
+        &self,
+        channel_id: &str,
+        text: &str,
+    ) -> Result<PostMessageResponse, SlackError> {
+        self.post_json(
+            "chat.postMessage",
+            &serde_json::json!({
+                "channel": channel_id,
+                "text": text,
+                "as_user": true,
+                "link_names": true,
+            }),
+        )
+        .await
+    }
+
+    /// Send a threaded reply to a message.
+    pub async fn send_reply(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        text: &str,
+    ) -> Result<PostMessageResponse, SlackError> {
+        self.post_json(
+            "chat.postMessage",
+            &serde_json::json!({
+                "channel": channel_id,
+                "text": text,
+                "thread_ts": thread_ts,
+                "as_user": true,
+                "link_names": true,
+            }),
+        )
+        .await
+    }
+
+    // ---- chat.command ----
+
+    /// Send a slash command (undocumented endpoint).
+    pub async fn send_command(
+        &self,
+        channel_id: &str,
+        command: &str,
+        text: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_form(
+                "chat.command",
+                &[
+                    ("channel", channel_id),
+                    ("command", command),
+                    ("text", text),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 // ---- Response types ----
@@ -378,6 +440,17 @@ struct BotInfoResponse {
 pub struct BotInfo {
     pub id: String,
     pub name: String,
+}
+
+/// Response from chat.postMessage.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostMessageResponse {
+    #[allow(dead_code)]
+    ok: bool,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default, rename = "ts")]
+    pub timestamp: String,
 }
 
 /// Response from users.getPresence.
@@ -884,5 +957,26 @@ mod tests {
     fn test_response_metadata_empty_cursor() {
         let meta = ResponseMetadata::default();
         assert!(meta.next_cursor.is_empty());
+    }
+
+    #[test]
+    fn test_post_message_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "channel": "C123",
+            "ts": "1234567890.123456"
+        }"#;
+
+        let resp: PostMessageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.channel, "C123");
+        assert_eq!(resp.timestamp, "1234567890.123456");
+    }
+
+    #[test]
+    fn test_post_message_response_minimal() {
+        let json = r#"{"ok": true}"#;
+        let resp: PostMessageResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.channel.is_empty());
+        assert!(resp.timestamp.is_empty());
     }
 }
