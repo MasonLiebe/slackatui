@@ -62,7 +62,7 @@ You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.sla
    - `mpim:read`, `mpim:history`, `mpim:write`
    - `chat:write`
    - `users:read`, `users:write`
-5. Note your **Client ID** from the **Basic Information** page
+5. Note your **Client ID** and **Client Secret** from the **Basic Information** page (under "App Credentials")
 
 ### 4. Configure slackatui
 
@@ -79,12 +79,13 @@ $EDITOR ~/Library/Application\ Support/slackatui/config
 # $EDITOR ~/.config/slackatui/config
 ```
 
-Set your Client ID and redirect URI in the config JSON:
+Set your Client ID, Client Secret, and redirect URI in the config JSON:
 
 ```json
 {
   "auth": {
     "client_id": "YOUR_CLIENT_ID_HERE",
+    "client_secret": "YOUR_CLIENT_SECRET_HERE",
     "redirect_uri": "https://localhost:8888",
     "token_store": "keychain",
     "token_preference": "user"
@@ -98,6 +99,7 @@ Set your Client ID and redirect URI in the config JSON:
 | Field | Description |
 |---|---|
 | `auth.client_id` | Your Slack App's Client ID (from step 3) |
+| `auth.client_secret` | Your Slack App's Client Secret (from step 3) |
 | `auth.redirect_uri` | Must match what you set in the Slack App (`https://localhost:8888`) |
 | `auth.token_store` | `"keychain"` (macOS Keychain) or `"file"` (JSON at `~/.config/slackatui/tokens.json`) |
 | `auth.token_preference` | `"user"` (recommended) or `"bot"` |

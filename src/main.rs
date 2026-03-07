@@ -77,7 +77,7 @@ fn run_auth(cfg: &Config) {
     rt.block_on(async {
         let oauth_cfg = auth::OAuthConfig {
             client_id: cfg.auth.client_id.clone(),
-            client_secret: String::new(),
+            client_secret: cfg.auth.client_secret.clone(),
             redirect_uri: cfg.auth.redirect_uri.clone(),
             scopes: Vec::new(),
             user_scopes: auth::DEFAULT_USER_SCOPES
@@ -89,6 +89,15 @@ fn run_auth(cfg: &Config) {
 
         if oauth_cfg.client_id.is_empty() {
             eprintln!("Error: auth.client_id is not set in config.");
+            eprintln!("Set it in: {}", config::default_config_path().display());
+            std::process::exit(1);
+        }
+
+        if oauth_cfg.client_secret.is_empty() {
+            eprintln!("Error: auth.client_secret is not set in config.");
+            eprintln!(
+                "Find it in your Slack App's Basic Information page under \"App Credentials\"."
+            );
             eprintln!("Set it in: {}", config::default_config_path().display());
             std::process::exit(1);
         }

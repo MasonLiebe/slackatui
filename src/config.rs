@@ -19,6 +19,8 @@ pub struct AuthConfig {
     #[serde(default)]
     pub client_id: String,
     #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
     pub redirect_uri: String,
     #[serde(default)]
     pub token_store: String,
@@ -32,6 +34,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             client_id: String::new(),
+            client_secret: String::new(),
             redirect_uri: String::new(),
             token_store: "keychain".to_string(),
             token_preference: "user".to_string(),

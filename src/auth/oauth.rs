@@ -237,55 +237,6 @@ fn build_tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor, OA
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Handle a single TLS connection: accept, handshake, serve one HTTP request.
-/// Returns the HTTP request URI path so the caller can decide what happened.
-async fn serve_one_tls_request(
-    listener: &TcpListener,
-    tls_acceptor: &TlsAcceptor,
-    response_body: String,
-) -> Result<String, OAuthError> {
-    let (tcp_stream, _) = listener
-        .accept()
-        .await
-        .map_err(|e| OAuthError::ServerFailed(e.to_string()))?;
-
-    let tls_stream = tls_acceptor
-        .accept(tcp_stream)
-        .await
-        .map_err(|e| OAuthError::ServerFailed(format!("TLS handshake failed: {}", e)))?;
-
-    let io = hyper_util::rt::TokioIo::new(tls_stream);
-
-    let (uri_tx, uri_rx) = oneshot::channel::<String>();
-    let uri_tx = std::sync::Mutex::new(Some(uri_tx));
-    let body = response_body.clone();
-
-    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let uri = req.uri().to_string();
-        if let Some(tx) = uri_tx.lock().unwrap().take() {
-            let _ = tx.send(uri);
-        }
-        let body = body.clone();
-        async move {
-            Ok::<_, hyper::Error>(
-                hyper::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/html")
-                    .body(full_body(&body))
-                    .unwrap(),
-            )
-        }
-    });
-
-    let _ = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, service)
-        .await;
-
-    uri_rx
-        .await
-        .map_err(|_| OAuthError::ServerFailed("connection closed before request".to_string()))
-}
-
 /// Run the complete OAuth v2 authorization flow:
 /// 1. Start a local HTTPS callback server with a self-signed cert
 /// 2. Open the browser to https://localhost first so the user accepts the cert
@@ -345,34 +296,79 @@ pub async fn run_oauth_flow(cfg: &mut OAuthConfig) -> Result<TokenResponse, OAut
         auth_url, auth_url
     );
 
-    // Serve the redirect page. The browser may make multiple requests (favicon, etc.)
-    // so we loop until we get the callback with the auth code.
+    // Serve requests in a loop. The browser may make multiple connections that fail
+    // TLS (before the user accepts the self-signed cert), plus favicon requests, etc.
+    // We keep looping until we get the actual OAuth callback with an auth code.
+    let mut showed_waiting = false;
     let code = tokio::select! {
         result = async {
-            // Serve the initial redirect page
-            let _ = serve_one_tls_request(&listener, &tls_acceptor, redirect_html.clone()).await;
-
-            println!("Waiting for Slack authorization...");
-
-            // Now wait for the OAuth callback (and handle any intermediate requests)
             loop {
-                let success_html = "<html><body><h2>Authorization successful!</h2>\
-                    <p>You can close this tab and return to the terminal.</p></body></html>"
-                    .to_string();
+                // Accept a TCP connection
+                let (tcp_stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => continue,
+                };
 
-                match serve_one_tls_request(&listener, &tls_acceptor, success_html).await {
-                    Ok(uri) => {
-                        match handle_callback(&uri, &state) {
-                            Ok(code) => return Ok(code),
-                            Err(OAuthError::Denied(msg)) => return Err(OAuthError::Denied(msg)),
-                            Err(OAuthError::StateMismatch) => {
-                                // Could be a favicon or other request, keep waiting
-                                continue;
-                            }
-                            Err(_) => continue, // keep waiting for the real callback
-                        }
+                // Attempt TLS handshake — this will fail until the user accepts the cert
+                let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
+                    Err(_) => continue, // browser preflight, favicon, cert not yet accepted — retry
+                };
+
+                // TLS succeeded — serve an HTTP request
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let (uri_tx, uri_rx) = oneshot::channel::<String>();
+                let uri_tx = std::sync::Mutex::new(Some(uri_tx));
+
+                // Decide which page to serve: redirect page or success page
+                let body = if !showed_waiting {
+                    redirect_html.clone()
+                } else {
+                    "<html><body><h2>Authorization successful!</h2>\
+                     <p>You can close this tab and return to the terminal.</p></body></html>"
+                        .to_string()
+                };
+
+                let body_clone = body.clone();
+                let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let uri = req.uri().to_string();
+                    if let Some(tx) = uri_tx.lock().unwrap().take() {
+                        let _ = tx.send(uri);
                     }
-                    Err(e) => return Err(e),
+                    let body = body_clone.clone();
+                    async move {
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("Content-Type", "text/html")
+                                .body(full_body(&body))
+                                .unwrap(),
+                        )
+                    }
+                });
+
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(io, service)
+                    .await;
+
+                let uri = match uri_rx.await {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+
+                // First successful TLS request serves the redirect page
+                if !showed_waiting {
+                    showed_waiting = true;
+                    println!("Waiting for Slack authorization...");
+                    continue;
+                }
+
+                // Subsequent requests: check if this is the OAuth callback
+                match handle_callback(&uri, &state) {
+                    Ok(code) => return Ok(code),
+                    Err(OAuthError::Denied(msg)) => return Err(OAuthError::Denied(msg)),
+                    Err(_) => continue, // favicon, state mismatch, etc. — keep waiting
                 }
             }
         } => result,
