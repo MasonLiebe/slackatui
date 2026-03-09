@@ -5,7 +5,9 @@ A Slack client for your terminal, built with Rust and [ratatui](https://ratatui.
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-![slackatui demo](demo.gif)
+<p align="center">
+  <img src="demo.gif" alt="slackatui demo" width="100%">
+</p>
 
 ## Features
 
