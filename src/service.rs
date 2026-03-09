@@ -173,8 +173,17 @@ impl SlackService {
         // Map attached files
         for f in &sm.files {
             if !f.url_private.is_empty() {
+                // Use the actual filename (name) for saving; fall back to title + filetype
+                let filename = if !f.name.is_empty() {
+                    f.name.clone()
+                } else if !f.filetype.is_empty() && !f.title.contains('.') {
+                    format!("{}.{}", f.title, f.filetype)
+                } else {
+                    f.title.clone()
+                };
                 msg.files.push(AttachedFile {
                     file_id: f.id.clone(),
+                    name: filename,
                     title: f.title.clone(),
                     url: f.url_private.clone(),
                     is_image: f.is_image(),

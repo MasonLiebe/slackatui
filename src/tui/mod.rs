@@ -74,6 +74,7 @@ pub struct App {
     // Download state
     pub download_dir: String,
     pub download_file_url: String,
+    pub download_file_name: String,
     pub download_file_title: String,
     pub download_tab_matches: Vec<String>,
     pub download_tab_index: usize,
@@ -130,6 +131,7 @@ impl App {
                 })
                 .unwrap_or_else(|| "~/Downloads/".to_string()),
             download_file_url: String::new(),
+            download_file_name: String::new(),
             download_file_title: String::new(),
             download_tab_matches: Vec::new(),
             download_tab_index: 0,
@@ -508,9 +510,9 @@ enum AsyncAction {
     SelectChannel { index: usize },
     OpenThread { channel_id: String, thread_ts: String },
     ToggleReaction { channel_id: String, timestamp: String, emoji_name: String, msg_idx: usize },
-    OpenFile { file_id: String, url: String, title: String, is_image: bool },
+    OpenFile { file_id: String, url: String, name: String, title: String, is_image: bool },
     UploadFile { channel_id: String, file_path: String, thread_ts: Option<String> },
-    DownloadFile { url: String, title: String, dest_dir: String },
+    DownloadFile { url: String, name: String, title: String, dest_dir: String },
     TogglePresence,
     SetStatus { text: String, emoji: String },
 }
@@ -933,7 +935,7 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
             }
         }
-        AsyncAction::OpenFile { file_id, url, title, is_image } => {
+        AsyncAction::OpenFile { file_id, url, name, title, is_image } => {
             app.status = format!("Downloading {}...", title);
             match svc.client.download_file(&url).await {
                 Ok(bytes) => {
@@ -961,7 +963,7 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                         // Non-image: save to temp and open with system viewer
                         let tmp_dir = std::env::temp_dir().join("slackatui");
                         let _ = std::fs::create_dir_all(&tmp_dir);
-                        let tmp_path = tmp_dir.join(&title);
+                        let tmp_path = tmp_dir.join(&name);
                         if let Err(e) = std::fs::write(&tmp_path, &bytes) {
                             app.status = format!("Write error: {}", e);
                         } else if let Err(e) = open::that(&tmp_path) {
@@ -1035,7 +1037,7 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
             }
         }
-        AsyncAction::DownloadFile { url, title, dest_dir } => {
+        AsyncAction::DownloadFile { url, name, title, dest_dir } => {
             app.status = format!("Downloading {}...", title);
             match svc.client.download_file(&url).await {
                 Ok(bytes) => {
@@ -1053,7 +1055,8 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                         app.status = format!("Directory error: {}", e);
                         return;
                     }
-                    let dest_path = expanded_dir.join(&title);
+                    // Use actual filename (preserves extension/filetype)
+                    let dest_path = expanded_dir.join(&name);
                     match std::fs::write(&dest_path, &bytes) {
                         Ok(()) => {
                             let size = bytes.len();
@@ -1215,6 +1218,7 @@ fn handle_key_async(
                         })
                         .unwrap_or_else(|| "~/Downloads/".to_string());
                     app.download_file_url.clear();
+                    app.download_file_name.clear();
                     app.download_file_title.clear();
                     app.download_tab_matches.clear();
                     app.download_tab_index = 0;
@@ -1223,16 +1227,19 @@ fn handle_key_async(
                 KeyCode::Enter => {
                     let dir = app.download_dir.trim().to_string();
                     let url = app.download_file_url.clone();
+                    let name = app.download_file_name.clone();
                     let title = app.download_file_title.clone();
                     if !url.is_empty() && !dir.is_empty() {
                         let _ = action_tx.send(AsyncAction::DownloadFile {
                             url,
+                            name,
                             title,
                             dest_dir: dir,
                         });
                     }
                     app.mode = Mode::Command;
                     app.download_file_url.clear();
+                    app.download_file_name.clear();
                     app.download_file_title.clear();
                     app.download_tab_matches.clear();
                     app.download_tab_index = 0;
@@ -1741,6 +1748,7 @@ fn dispatch_action(
                             let _ = action_tx.send(AsyncAction::OpenFile {
                                 file_id: file.file_id.clone(),
                                 url: file.url.clone(),
+                                name: file.name.clone(),
                                 title: file.title.clone(),
                                 is_image: file.is_image,
                             });
@@ -1767,6 +1775,7 @@ fn dispatch_action(
                 if let Some(msg) = app.messages.get(idx) {
                     if let Some(file) = msg.files.first() {
                         app.download_file_url = file.url.clone();
+                        app.download_file_name = file.name.clone();
                         app.download_file_title = file.title.clone();
                         app.download_tab_matches.clear();
                         app.download_tab_index = 0;

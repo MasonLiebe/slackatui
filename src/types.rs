@@ -52,6 +52,7 @@ impl ChannelItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachedFile {
     pub file_id: String,
+    pub name: String,
     pub title: String,
     pub url: String,
     pub is_image: bool,

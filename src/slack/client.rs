@@ -809,7 +809,11 @@ pub struct SlackFile {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub filetype: String,
     #[serde(default)]
     pub mimetype: String,
     #[serde(default)]
