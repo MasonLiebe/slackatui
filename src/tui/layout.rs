@@ -1063,6 +1063,32 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Rgb(100, 100, 120)),
             ),
         ]),
+        Mode::Download => {
+            let mut spans = vec![
+                Span::styled(
+                    " DOWNLOAD ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(100, 180, 220))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" dir: ", Style::default().fg(Color::Rgb(100, 180, 220))),
+                Span::raw(&app.download_dir),
+                Span::styled("\u{258e}", Style::default().fg(Color::Rgb(100, 180, 220))),
+            ];
+            if !app.status.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", &app.status),
+                    Style::default().fg(Color::Rgb(140, 140, 160)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "  Tab=complete, Enter=download, Esc=cancel",
+                    Style::default().fg(Color::Rgb(100, 100, 120)),
+                ));
+            }
+            Line::from(spans)
+        }
         Mode::Command => {
             let mode_badge = Span::styled(
                 " COMMAND ",
@@ -1137,7 +1163,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if has_file {
                     spans.push(Span::styled("o", Style::default().fg(Color::Rgb(100, 200, 140))));
-                    spans.push(Span::styled("=open file ", Style::default().fg(Color::Rgb(100, 200, 140))));
+                    spans.push(Span::styled("=open ", Style::default().fg(Color::Rgb(100, 200, 140))));
+                    spans.push(Span::styled("d", Style::default().fg(Color::Rgb(100, 180, 220))));
+                    spans.push(Span::styled("=download ", Style::default().fg(Color::Rgb(100, 180, 220))));
                 }
                 spans.push(Span::styled("u", Style::default().fg(Color::White)));
                 spans.push(Span::styled("=upload ", Style::default().fg(Color::Rgb(100, 100, 120))));

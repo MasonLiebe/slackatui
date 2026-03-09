@@ -116,6 +116,7 @@ pub enum Mode {
     Search,
     React,
     Upload,
+    Download,
 }
 
 /// Which pane has focus.

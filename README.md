@@ -177,6 +177,7 @@ The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Threa
 | `r` | Reply to selected message in thread |
 | `e` | Open emoji reaction picker |
 | `o` | Open/view file attachment |
+| `d` | Download file to directory (with tab completion) |
 | `u` | Upload a file |
 | `p` | Toggle presence (active/away) |
 | `q` | Quit |

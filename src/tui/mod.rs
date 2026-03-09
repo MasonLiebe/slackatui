@@ -71,6 +71,13 @@ pub struct App {
     // Staged files waiting to be uploaded (from drag-and-drop)
     pub staged_files: Vec<String>,
 
+    // Download state
+    pub download_dir: String,
+    pub download_file_url: String,
+    pub download_file_title: String,
+    pub download_tab_matches: Vec<String>,
+    pub download_tab_index: usize,
+
     // Per-channel last-seen message timestamp (for unread detection)
     pub last_read_ts: HashMap<String, String>,
     pub unread_poll_cursor: usize,
@@ -114,6 +121,18 @@ impl App {
             image_cache: HashMap::new(),
             upload_path: String::new(),
             staged_files: Vec::new(),
+            download_dir: dirs::download_dir()
+                .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+                .map(|p| {
+                    let mut s = p.to_string_lossy().to_string();
+                    if !s.ends_with('/') { s.push('/'); }
+                    s
+                })
+                .unwrap_or_else(|| "~/Downloads/".to_string()),
+            download_file_url: String::new(),
+            download_file_title: String::new(),
+            download_tab_matches: Vec::new(),
+            download_tab_index: 0,
             last_read_ts: HashMap::new(),
             unread_poll_cursor: 0,
             own_presence: "active".to_string(),
@@ -134,7 +153,7 @@ impl App {
             Mode::Command => "command",
             Mode::Insert => "insert",
             Mode::Search => "search",
-            Mode::React | Mode::Upload => return None, // handled inline
+            Mode::React | Mode::Upload | Mode::Download => return None, // handled inline
         };
         self.config.key_map.get(mode_key)
     }
@@ -491,6 +510,7 @@ enum AsyncAction {
     ToggleReaction { channel_id: String, timestamp: String, emoji_name: String, msg_idx: usize },
     OpenFile { file_id: String, url: String, title: String, is_image: bool },
     UploadFile { channel_id: String, file_path: String, thread_ts: Option<String> },
+    DownloadFile { url: String, title: String, dest_dir: String },
     TogglePresence,
     SetStatus { text: String, emoji: String },
 }
@@ -1015,6 +1035,47 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
             }
         }
+        AsyncAction::DownloadFile { url, title, dest_dir } => {
+            app.status = format!("Downloading {}...", title);
+            match svc.client.download_file(&url).await {
+                Ok(bytes) => {
+                    // Expand ~ in dest_dir
+                    let expanded_dir = if dest_dir.starts_with("~/") {
+                        if let Some(home) = dirs::home_dir() {
+                            home.join(&dest_dir[2..])
+                        } else {
+                            std::path::PathBuf::from(&dest_dir)
+                        }
+                    } else {
+                        std::path::PathBuf::from(&dest_dir)
+                    };
+                    if let Err(e) = std::fs::create_dir_all(&expanded_dir) {
+                        app.status = format!("Directory error: {}", e);
+                        return;
+                    }
+                    let dest_path = expanded_dir.join(&title);
+                    match std::fs::write(&dest_path, &bytes) {
+                        Ok(()) => {
+                            let size = bytes.len();
+                            let size_str = if size > 1_048_576 {
+                                format!("{:.1} MB", size as f64 / 1_048_576.0)
+                            } else if size > 1024 {
+                                format!("{:.1} KB", size as f64 / 1024.0)
+                            } else {
+                                format!("{} B", size)
+                            };
+                            app.status = format!("Saved {} ({}) to {}", title, size_str, dest_path.display());
+                        }
+                        Err(e) => {
+                            app.status = format!("Write error: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.status = format!("Download error: {}", e);
+                }
+            }
+        }
         AsyncAction::TogglePresence => {
             let new_presence = if app.own_presence == "active" { "away" } else { "auto" };
             match svc.client.set_user_presence(new_presence).await {
@@ -1141,6 +1202,74 @@ fn handle_key_async(
                 _ => {}
             }
         }
+        Mode::Download => {
+            match code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Command;
+                    app.download_dir = dirs::download_dir()
+                        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+                        .map(|p| {
+                            let mut s = p.to_string_lossy().to_string();
+                            if !s.ends_with('/') { s.push('/'); }
+                            s
+                        })
+                        .unwrap_or_else(|| "~/Downloads/".to_string());
+                    app.download_file_url.clear();
+                    app.download_file_title.clear();
+                    app.download_tab_matches.clear();
+                    app.download_tab_index = 0;
+                    app.status.clear();
+                }
+                KeyCode::Enter => {
+                    let dir = app.download_dir.trim().to_string();
+                    let url = app.download_file_url.clone();
+                    let title = app.download_file_title.clone();
+                    if !url.is_empty() && !dir.is_empty() {
+                        let _ = action_tx.send(AsyncAction::DownloadFile {
+                            url,
+                            title,
+                            dest_dir: dir,
+                        });
+                    }
+                    app.mode = Mode::Command;
+                    app.download_file_url.clear();
+                    app.download_file_title.clear();
+                    app.download_tab_matches.clear();
+                    app.download_tab_index = 0;
+                }
+                KeyCode::Tab => {
+                    tab_complete_dir(&mut app.download_dir, &mut app.download_tab_matches, &mut app.download_tab_index, &mut app.status);
+                }
+                KeyCode::BackTab => {
+                    if !app.download_tab_matches.is_empty() {
+                        if app.download_tab_index == 0 {
+                            app.download_tab_index = app.download_tab_matches.len() - 1;
+                        } else {
+                            app.download_tab_index -= 1;
+                        }
+                        app.download_dir = app.download_tab_matches[app.download_tab_index].clone();
+                        let count = app.download_tab_matches.len();
+                        app.status = format!("({}/{}) matches", app.download_tab_index + 1, count);
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.download_dir.pop();
+                    app.download_tab_matches.clear();
+                    app.download_tab_index = 0;
+                }
+                KeyCode::Char(c) => {
+                    let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    app.download_dir.push(ch);
+                    app.download_tab_matches.clear();
+                    app.download_tab_index = 0;
+                }
+                _ => {}
+            }
+        }
         Mode::Upload => {
             match code {
                 KeyCode::Esc => {
@@ -1214,6 +1343,26 @@ fn handle_paste(
     // In upload mode, replace the path input
     if app.mode == Mode::Upload {
         app.upload_path = data.trim().trim_matches('\'').trim_matches('"').to_string();
+        return;
+    }
+
+    // In download mode, replace the dir path
+    if app.mode == Mode::Download {
+        let mut pasted = data.trim().trim_matches('\'').trim_matches('"').to_string();
+        // If it's a directory, ensure trailing slash
+        let expanded = if pasted.starts_with("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(&pasted[2..]))
+                .unwrap_or_else(|| std::path::PathBuf::from(&pasted))
+        } else {
+            std::path::PathBuf::from(&pasted)
+        };
+        if expanded.is_dir() && !pasted.ends_with('/') {
+            pasted.push('/');
+        }
+        app.download_dir = pasted;
+        app.download_tab_matches.clear();
+        app.download_tab_index = 0;
         return;
     }
 
@@ -1612,6 +1761,24 @@ fn dispatch_action(
             }
         }
 
+        // Download file attached to selected message
+        "download-file" => {
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    if let Some(file) = msg.files.first() {
+                        app.download_file_url = file.url.clone();
+                        app.download_file_title = file.title.clone();
+                        app.download_tab_matches.clear();
+                        app.download_tab_index = 0;
+                        app.mode = Mode::Download;
+                        app.status = format!("Download \"{}\" to:", file.title);
+                    } else {
+                        app.status = "No file on this message".to_string();
+                    }
+                }
+            }
+        }
+
         // Toggle presence (active/away)
         "toggle-presence" => {
             let _ = action_tx.send(AsyncAction::TogglePresence);
@@ -1623,7 +1790,7 @@ fn dispatch_action(
         // Help
         "help" => {
             app.status =
-                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload p=presence q=quit".to_string();
+                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload d=download p=presence q=quit".to_string();
         }
 
         _ => {}
@@ -1674,6 +1841,131 @@ fn insert_wrap_markers(app: &mut App, marker: char) {
     app.cursor_pos += marker.len_utf8();
     app.input.insert(app.cursor_pos, marker);
     // Cursor stays between the two markers
+}
+
+/// Tab-complete a directory path. On first Tab, compute matches. On subsequent Tabs, cycle.
+fn tab_complete_dir(
+    input: &mut String,
+    matches: &mut Vec<String>,
+    tab_idx: &mut usize,
+    status: &mut String,
+) {
+    // If we already have matches, cycle forward
+    if !matches.is_empty() {
+        *tab_idx = (*tab_idx + 1) % matches.len();
+        *input = matches[*tab_idx].clone();
+        let count = matches.len();
+        *status = format!("({}/{}) matches", *tab_idx + 1, count);
+        return;
+    }
+
+    // Expand ~ for filesystem access
+    let expanded = if input.starts_with("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(&input[2..]))
+            .unwrap_or_else(|| std::path::PathBuf::from(input.as_str()))
+    } else {
+        std::path::PathBuf::from(input.as_str())
+    };
+
+    if expanded.is_dir() {
+        // Path is already a complete directory — list its subdirectories
+        if let Ok(entries) = std::fs::read_dir(&expanded) {
+            let mut dirs: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| {
+                    let mut s = format!("{}/", input.trim_end_matches('/'));
+                    s.push_str(&e.file_name().to_string_lossy());
+                    s.push('/');
+                    s
+                })
+                .collect();
+            dirs.sort();
+            if dirs.len() == 1 {
+                *input = dirs[0].clone();
+                *status = String::new();
+            } else if !dirs.is_empty() {
+                *input = dirs[0].clone();
+                *status = format!("(1/{}) matches — Tab to cycle", dirs.len());
+                *matches = dirs;
+                *tab_idx = 0;
+            } else {
+                *status = "No subdirectories".to_string();
+            }
+        }
+    } else {
+        // Partial path — complete the last segment
+        let parent = expanded.parent();
+        let prefix = expanded
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let input_parent = if let Some(last_slash) = input.rfind('/') {
+            &input[..=last_slash]
+        } else {
+            ""
+        };
+
+        if let Some(parent_dir) = parent {
+            if parent_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(parent_dir) {
+                    let mut dirs: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                                && e.file_name()
+                                    .to_string_lossy()
+                                    .starts_with(&prefix)
+                        })
+                        .map(|e| {
+                            format!("{}{}/", input_parent, e.file_name().to_string_lossy())
+                        })
+                        .collect();
+                    dirs.sort();
+                    if dirs.len() == 1 {
+                        *input = dirs[0].clone();
+                        *status = String::new();
+                    } else if !dirs.is_empty() {
+                        // Complete to common prefix
+                        let common = common_prefix(&dirs);
+                        if common.len() > input.len() {
+                            *input = common;
+                        } else {
+                            *input = dirs[0].clone();
+                            *matches = dirs;
+                            *tab_idx = 0;
+                        }
+                        let count = matches.len().max(1);
+                        *status = format!("({} matches) Tab to cycle", count);
+                    } else {
+                        *status = "No matches".to_string();
+                    }
+                }
+            } else {
+                *status = "Directory not found".to_string();
+            }
+        }
+    }
+}
+
+/// Find the longest common prefix of a set of strings.
+fn common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let first = &strings[0];
+    let mut len = first.len();
+    for s in &strings[1..] {
+        len = len.min(s.len());
+        for (i, (a, b)) in first.bytes().zip(s.bytes()).enumerate() {
+            if a != b {
+                len = len.min(i);
+                break;
+            }
+        }
+    }
+    first[..len].to_string()
 }
 
 /// Hide the thread pane if the currently selected message has no replies.
