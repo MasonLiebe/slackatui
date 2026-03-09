@@ -14,7 +14,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::collections::HashMap;
 use std::io::{self, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
@@ -88,6 +88,39 @@ pub struct App {
     pub own_status_text: String,
     pub own_status_emoji: String,
 
+    // Edit message state (when editing an existing message)
+    pub editing_ts: Option<String>,      // timestamp of message being edited
+    pub editing_msg_idx: Option<usize>,  // index in messages vec
+
+    // Delete confirmation state
+    pub confirm_delete: Option<usize>,   // index of message pending deletion
+
+    // Auto-clear status after a delay
+    pub status_set_at: Option<Instant>,
+
+    // @mention autocomplete state
+    pub mention_active: bool,
+    pub mention_query: String,
+    pub mention_results: Vec<(String, String)>, // (user_id, display_name)
+    pub mention_selected: usize,
+    pub user_cache: HashMap<String, String>, // user_id -> name (for autocomplete)
+
+    // Help popup
+    pub help_visible: bool,
+
+    // Message search state
+    pub msg_search_query: String,
+    pub msg_search_results: Vec<crate::slack::SearchMatch>,
+    pub msg_search_selected: usize,
+    pub msg_search_loading: bool,
+
+    // Typing indicator: user_id → (channel_id, when)
+    pub typing_users: HashMap<String, (String, Instant)>,
+
+    // Member list panel
+    pub members: Vec<(String, String)>, // (user_id, display_name)
+    pub members_visible: bool,
+
     // Status / mode indicator
     pub status: String,
 }
@@ -140,8 +173,31 @@ impl App {
             own_presence: "active".to_string(),
             own_status_text: String::new(),
             own_status_emoji: String::new(),
+            editing_ts: None,
+            editing_msg_idx: None,
+            confirm_delete: None,
+            status_set_at: None,
+            mention_active: false,
+            mention_query: String::new(),
+            mention_results: Vec::new(),
+            mention_selected: 0,
+            user_cache: HashMap::new(),
+            help_visible: false,
+            msg_search_query: String::new(),
+            msg_search_results: Vec::new(),
+            msg_search_selected: 0,
+            msg_search_loading: false,
+            typing_users: HashMap::new(),
+            members: Vec::new(),
+            members_visible: false,
             status: String::new(),
         }
+    }
+
+    /// Set a transient status message that auto-clears after a few seconds.
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_set_at = Some(Instant::now());
     }
 
     /// Returns the currently selected channel, if any.
@@ -155,7 +211,7 @@ impl App {
             Mode::Command => "command",
             Mode::Insert => "insert",
             Mode::Search => "search",
-            Mode::React | Mode::Upload | Mode::Download => return None, // handled inline
+            Mode::React | Mode::Upload | Mode::Download | Mode::MessageSearch => return None,
         };
         self.config.key_map.get(mode_key)
     }
@@ -368,6 +424,7 @@ pub async fn run_async(config: Config, mut svc: SlackService) -> io::Result<()> 
         .get(&svc.current_user_id)
         .cloned()
         .unwrap_or_else(|| "me".to_string());
+    app.user_cache = svc.user_cache.clone();
     app.status = "Loading channels...".to_string();
 
     // Set own presence to auto (makes us show as active)
@@ -513,8 +570,12 @@ enum AsyncAction {
     OpenFile { file_id: String, url: String, name: String, title: String, is_image: bool },
     UploadFile { channel_id: String, file_path: String, thread_ts: Option<String> },
     DownloadFile { url: String, name: String, title: String, dest_dir: String },
+    DeleteMessage { channel_id: String, timestamp: String, msg_idx: usize },
+    EditMessage { channel_id: String, timestamp: String, text: String, msg_idx: usize },
     TogglePresence,
     SetStatus { text: String, emoji: String },
+    LoadMembers { channel_id: String },
+    SearchMessages { query: String },
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -576,6 +637,17 @@ async fn async_main_loop(
                 handle_rtm_event(app, svc, rtm_event).await;
             }
         }
+
+        // Auto-clear transient status messages after 3 seconds
+        if let Some(set_at) = app.status_set_at {
+            if set_at.elapsed() >= Duration::from_secs(3) {
+                app.status.clear();
+                app.status_set_at = None;
+            }
+        }
+
+        // Expire typing indicators older than 5 seconds
+        app.typing_users.retain(|_, (_, when)| when.elapsed() < Duration::from_secs(5));
     }
 
     Ok(())
@@ -767,6 +839,12 @@ async fn handle_rtm_event(app: &mut App, svc: &mut SlackService, event: RtmEvent
 
             send_notification(app, &name, &content, &channel_name, is_dm, is_mention);
         }
+        RtmEvent::UserTyping(ev) => {
+            // Don't show our own typing
+            if ev.user != app.current_user_id {
+                app.typing_users.insert(ev.user, (ev.channel, Instant::now()));
+            }
+        }
         RtmEvent::Connected => {}
         RtmEvent::Disconnected => {}
         RtmEvent::Error(_) => {}
@@ -859,6 +937,8 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 app.selected_message = None;
                 app.thread_messages.clear();
                 app.thread_visible = false;
+                app.members.clear();
+                app.members_visible = false;
 
                 let ch_id = app.channels[index].id.clone();
                 app.channels[index].notification = false;
@@ -1079,6 +1159,51 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
             }
         }
+        AsyncAction::DeleteMessage { channel_id, timestamp, msg_idx } => {
+            match svc.client.delete_message(&channel_id, &timestamp).await {
+                Ok(()) => {
+                    // Remove the message from the local list
+                    if msg_idx < app.messages.len()
+                        && app.messages[msg_idx].timestamp == timestamp
+                    {
+                        app.messages.remove(msg_idx);
+                        // Adjust selection
+                        if let Some(sel) = app.selected_message {
+                            if sel >= app.messages.len() && !app.messages.is_empty() {
+                                app.selected_message = Some(app.messages.len() - 1);
+                            } else if app.messages.is_empty() {
+                                app.selected_message = None;
+                            }
+                        }
+                    }
+                    app.status = "Message deleted".to_string();
+                }
+                Err(e) => {
+                    app.status = format!("Delete error: {}", e);
+                }
+            }
+        }
+        AsyncAction::EditMessage { channel_id, timestamp, text, msg_idx } => {
+            match svc.client.update_message(&channel_id, &timestamp, &text).await {
+                Ok(()) => {
+                    // Update the local message content
+                    let display_text = crate::parse::parse_message(
+                        &text,
+                        svc.emoji_enabled,
+                        &svc.user_cache,
+                    );
+                    if msg_idx < app.messages.len()
+                        && app.messages[msg_idx].timestamp == timestamp
+                    {
+                        app.messages[msg_idx].content = display_text;
+                    }
+                    app.status = "Message edited".to_string();
+                }
+                Err(e) => {
+                    app.status = format!("Edit error: {}", e);
+                }
+            }
+        }
         AsyncAction::TogglePresence => {
             let new_presence = if app.own_presence == "active" { "away" } else { "auto" };
             match svc.client.set_user_presence(new_presence).await {
@@ -1103,6 +1228,46 @@ async fn handle_async_action(app: &mut App, svc: &mut SlackService, action: Asyn
                 }
             }
         }
+        AsyncAction::SearchMessages { query } => {
+            app.msg_search_loading = false;
+            match svc.client.search_messages(&query, 20).await {
+                Ok(matches) => {
+                    app.msg_search_results = matches;
+                    app.msg_search_selected = 0;
+                    if app.msg_search_results.is_empty() {
+                        app.status = "No results found".to_string();
+                    }
+                }
+                Err(e) => {
+                    app.set_status(format!("Search error: {}", e));
+                    app.mode = Mode::Command;
+                }
+            }
+        }
+        AsyncAction::LoadMembers { channel_id } => {
+            match svc.client.get_conversation_members(&channel_id).await {
+                Ok(member_ids) => {
+                    let mut members: Vec<(String, String)> = member_ids
+                        .into_iter()
+                        .map(|uid| {
+                            let name = svc.user_cache.get(&uid).cloned().unwrap_or_else(|| uid.clone());
+                            (uid, name)
+                        })
+                        .collect();
+                    members.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                    app.members = members;
+                    app.members_visible = true;
+                }
+                Err(e) => {
+                    app.set_status(format!("Members error: {}", e));
+                }
+            }
+        }
+    }
+
+    // Mark async result statuses for auto-clear
+    if !app.status.is_empty() && app.status_set_at.is_none() {
+        app.status_set_at = Some(Instant::now());
     }
 }
 
@@ -1115,11 +1280,71 @@ fn handle_key_async(
 ) {
     let key_str = key_to_string(code, modifiers);
 
+    // Dismiss help popup on any key (except the toggle key itself)
+    if app.help_visible {
+        let is_help_toggle = app.current_keymap()
+            .and_then(|km| km.get(&key_str))
+            .map(|a| a == "help")
+            .unwrap_or(false);
+        if !is_help_toggle {
+            app.help_visible = false;
+            return;
+        }
+    }
+
     match app.mode {
         Mode::Insert => {
+            // @mention autocomplete intercepts when active
+            if app.mention_active {
+                match code {
+                    KeyCode::Tab | KeyCode::Enter if !app.mention_results.is_empty() => {
+                        // Accept the selected mention
+                        if let Some((user_id, _name)) = app.mention_results.get(app.mention_selected).cloned() {
+                            // Find and replace the @query in the input
+                            if let Some((at_pos, _)) = extract_mention_query(&app.input, app.cursor_pos) {
+                                // Replace @query with <@USER_ID> (Slack format)
+                                let end = app.cursor_pos;
+                                app.input.replace_range(at_pos..end, &format!("<@{}> ", user_id));
+                                app.cursor_pos = at_pos + user_id.len() + 4; // <@ID> + space
+                            }
+                        }
+                        app.mention_active = false;
+                        app.mention_query.clear();
+                        app.mention_results.clear();
+                        app.mention_selected = 0;
+                        // If Enter was pressed for accept, don't also send the message
+                        if code == KeyCode::Enter {
+                            return;
+                        }
+                    }
+                    KeyCode::Up => {
+                        app.mention_selected = app.mention_selected.saturating_sub(1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        if !app.mention_results.is_empty() {
+                            app.mention_selected = (app.mention_selected + 1).min(app.mention_results.len() - 1);
+                        }
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        app.mention_active = false;
+                        app.mention_query.clear();
+                        app.mention_results.clear();
+                        app.mention_selected = 0;
+                        return;
+                    }
+                    _ => {
+                        // Fall through to normal insert handling, then update mention state
+                    }
+                }
+            }
+
             if let Some(keymap) = app.current_keymap() {
                 if let Some(action) = keymap.get(&key_str) {
                     dispatch_action(app, action.clone(), action_tx);
+                    // After dispatch, update mention state
+                    update_mention_state(app);
                     return;
                 }
             }
@@ -1130,6 +1355,8 @@ fn handle_key_async(
                     c
                 };
                 app.input_char(ch);
+                // Update mention state after typing
+                update_mention_state(app);
             }
         }
         Mode::Search => {
@@ -1146,6 +1373,75 @@ fn handle_key_async(
                     c
                 };
                 app.search_input.push(ch);
+            }
+        }
+        Mode::MessageSearch => {
+            match code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Command;
+                    app.msg_search_query.clear();
+                    app.msg_search_results.clear();
+                    app.msg_search_selected = 0;
+                    app.msg_search_loading = false;
+                    app.status.clear();
+                }
+                KeyCode::Enter => {
+                    if app.msg_search_loading {
+                        // Still loading, ignore
+                    } else if app.msg_search_results.is_empty() {
+                        // No results yet — perform the search
+                        if !app.msg_search_query.is_empty() {
+                            app.msg_search_loading = true;
+                            app.status = "Searching...".to_string();
+                            let query = app.msg_search_query.clone();
+                            let _ = action_tx.send(AsyncAction::SearchMessages { query });
+                        }
+                    } else {
+                        // Results exist — jump to selected result
+                        if let Some(result) = app.msg_search_results.get(app.msg_search_selected) {
+                            let ch_id = result.channel.id.clone();
+                            // Find channel index
+                            if let Some(idx) = app.channels.iter().position(|c| c.id == ch_id) {
+                                let _ = action_tx.send(AsyncAction::SelectChannel { index: idx });
+                            }
+                            app.mode = Mode::Command;
+                            app.msg_search_query.clear();
+                            app.msg_search_results.clear();
+                            app.msg_search_selected = 0;
+                            app.status.clear();
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.msg_search_query.pop();
+                    // Clear results when query changes
+                    app.msg_search_results.clear();
+                    app.msg_search_selected = 0;
+                }
+                KeyCode::Up => {
+                    if app.msg_search_selected > 0 {
+                        app.msg_search_selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if !app.msg_search_results.is_empty()
+                        && app.msg_search_selected < app.msg_search_results.len() - 1
+                    {
+                        app.msg_search_selected += 1;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    app.msg_search_query.push(ch);
+                    // Clear old results when typing
+                    app.msg_search_results.clear();
+                    app.msg_search_selected = 0;
+                }
+                _ => {}
             }
         }
         Mode::React => {
@@ -1316,6 +1612,16 @@ fn handle_key_async(
             }
         }
         Mode::Command => {
+            // Clear delete confirmation on any key that isn't delete-message
+            let is_delete = app.current_keymap()
+                .and_then(|km| km.get(&key_str))
+                .map(|a| a == "delete-message")
+                .unwrap_or(false);
+            if app.confirm_delete.is_some() && !is_delete {
+                app.confirm_delete = None;
+                app.status.clear();
+            }
+
             // x clears staged files
             if !app.staged_files.is_empty() && key_str == "x" {
                 app.staged_files.clear();
@@ -1483,12 +1789,22 @@ fn dispatch_action(
         "mode-command" => {
             app.mode = Mode::Command;
             app.reply_thread_ts = None;
+            app.editing_ts = None;
+            app.editing_msg_idx = None;
             app.status.clear();
         }
         "mode-search" => {
             app.mode = Mode::Search;
             app.search_input.clear();
             app.status = "/".to_string();
+        }
+        "mode-msg-search" => {
+            app.mode = Mode::MessageSearch;
+            app.msg_search_query.clear();
+            app.msg_search_results.clear();
+            app.msg_search_selected = 0;
+            app.msg_search_loading = false;
+            app.status.clear();
         }
         "mode-react" => {
             if app.selected_message.is_some() {
@@ -1675,43 +1991,62 @@ fn dispatch_action(
             insert_wrap_markers(app, '_');
         }
 
-        // Send message
+        // Send message (or save edit)
         "send" => {
             let raw = app.take_input();
-            let thread_ts = app.reply_thread_ts.take();
-            // Convert hyphen bullets to Unicode bullets
             let text = convert_bullets(&raw);
-            if !text.is_empty() {
-                // Optimistic update: show message immediately
-                let optimistic = Message::new(
-                    format!("optimistic_{}", app.messages.len()),
-                    app.current_user_name.clone(),
-                    text.clone(),
-                    chrono::Local::now(),
-                );
-                if let Some(ref ts) = thread_ts {
-                    // Thread reply: add to thread pane and bump parent reply count
-                    app.thread_messages.push(optimistic);
-                    app.thread_scroll = 0;
-                    for msg in &mut app.messages {
-                        if msg.timestamp == *ts || msg.thread == *ts {
-                            msg.reply_count += 1;
-                            break;
-                        }
+
+            if let Some(edit_ts) = app.editing_ts.take() {
+                // Editing an existing message
+                let edit_idx = app.editing_msg_idx.take().unwrap_or(0);
+                if !text.is_empty() {
+                    if let Some(ch) = app.current_channel() {
+                        let ch_id = ch.id.clone();
+                        let _ = action_tx.send(AsyncAction::EditMessage {
+                            channel_id: ch_id,
+                            timestamp: edit_ts,
+                            text,
+                            msg_idx: edit_idx,
+                        });
                     }
-                } else {
-                    app.messages.push(optimistic);
                 }
-                let _ = action_tx.send(AsyncAction::SendMessage { text, thread_ts: thread_ts.clone() });
+                app.mode = Mode::Command;
+                app.status.clear();
+            } else {
+                // Sending a new message
+                let thread_ts = app.reply_thread_ts.take();
+                if !text.is_empty() {
+                    // Optimistic update: show message immediately
+                    let optimistic = Message::new(
+                        format!("optimistic_{}", app.messages.len()),
+                        app.current_user_name.clone(),
+                        text.clone(),
+                        chrono::Local::now(),
+                    );
+                    if let Some(ref ts) = thread_ts {
+                        // Thread reply: add to thread pane and bump parent reply count
+                        app.thread_messages.push(optimistic);
+                        app.thread_scroll = 0;
+                        for msg in &mut app.messages {
+                            if msg.timestamp == *ts || msg.thread == *ts {
+                                msg.reply_count += 1;
+                                break;
+                            }
+                        }
+                    } else {
+                        app.messages.push(optimistic);
+                    }
+                    let _ = action_tx.send(AsyncAction::SendMessage { text, thread_ts: thread_ts.clone() });
+                }
+                app.mode = Mode::Command;
+                if thread_ts.is_none() {
+                    // Regular message: scroll to bottom, deselect
+                    app.chat_scroll = 0;
+                    app.selected_message = None;
+                }
+                // Thread reply: keep selected_message so focus stays on parent
+                app.status.clear();
             }
-            app.mode = Mode::Command;
-            if thread_ts.is_none() {
-                // Regular message: scroll to bottom, deselect
-                app.chat_scroll = 0;
-                app.selected_message = None;
-            }
-            // Thread reply: keep selected_message so focus stays on parent
-            app.status.clear();
         }
 
         // Search
@@ -1743,7 +2078,7 @@ fn dispatch_action(
                 if let Some(msg) = app.messages.get(idx) {
                     if let Some(file) = msg.files.first() {
                         if file.is_image && app.image_cache.contains_key(&file.file_id) {
-                            app.status = "Image already loaded".to_string();
+                            app.set_status("Image already loaded");
                         } else {
                             let _ = action_tx.send(AsyncAction::OpenFile {
                                 file_id: file.file_id.clone(),
@@ -1754,7 +2089,7 @@ fn dispatch_action(
                             });
                         }
                     } else {
-                        app.status = "No file on this message".to_string();
+                        app.set_status("No file on this message");
                     }
                 }
             }
@@ -1782,8 +2117,65 @@ fn dispatch_action(
                         app.mode = Mode::Download;
                         app.status = format!("Download \"{}\" to:", file.title);
                     } else {
-                        app.status = "No file on this message".to_string();
+                        app.set_status("No file on this message");
                     }
+                }
+            }
+        }
+
+        // Delete selected message (own messages only, requires confirmation)
+        "delete-message" => {
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    if msg.name != app.current_user_name {
+                        app.set_status("Can only delete your own messages");
+                    } else if app.confirm_delete == Some(idx) {
+                        // Second press: confirmed, actually delete
+                        app.confirm_delete = None;
+                        if let Some(ch) = app.current_channel() {
+                            let ch_id = ch.id.clone();
+                            let ts = msg.timestamp.clone();
+                            let _ = action_tx.send(AsyncAction::DeleteMessage {
+                                channel_id: ch_id,
+                                timestamp: ts,
+                                msg_idx: idx,
+                            });
+                        }
+                    } else {
+                        // First press: ask for confirmation
+                        app.confirm_delete = Some(idx);
+                        app.status = "Press x again to delete, any other key to cancel".to_string();
+                        app.status_set_at = None; // don't auto-clear this one
+                    }
+                }
+            }
+        }
+
+        // Edit selected message (own messages only)
+        "edit-message" => {
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    if msg.name != app.current_user_name {
+                        app.set_status("Can only edit your own messages");
+                    } else {
+                        app.editing_ts = Some(msg.timestamp.clone());
+                        app.editing_msg_idx = Some(idx);
+                        // Pre-fill input with original content
+                        app.input = msg.content.clone();
+                        app.cursor_pos = app.input.len();
+                        app.mode = Mode::Insert;
+                        app.status = "Editing message — Enter to save, Esc to cancel".to_string();
+                    }
+                }
+            }
+        }
+
+        // Copy selected message to clipboard
+        "yank" => {
+            if let Some(idx) = app.selected_message {
+                if let Some(msg) = app.messages.get(idx) {
+                    copy_to_clipboard(&msg.content);
+                    app.set_status("Copied to clipboard");
                 }
             }
         }
@@ -1793,13 +2185,23 @@ fn dispatch_action(
             let _ = action_tx.send(AsyncAction::TogglePresence);
         }
 
+        // Toggle member list panel
+        "toggle-members" => {
+            if app.members_visible {
+                app.members_visible = false;
+                app.members.clear();
+            } else if let Some(ch) = app.current_channel() {
+                let ch_id = ch.id.clone();
+                let _ = action_tx.send(AsyncAction::LoadMembers { channel_id: ch_id });
+            }
+        }
+
         // Quit
         "quit" => app.running = false,
 
-        // Help
+        // Help popup toggle
         "help" => {
-            app.status =
-                "j/k=nav l=enter h=back i=insert /=search '=thread o=open u=upload d=download p=presence q=quit".to_string();
+            app.help_visible = !app.help_visible;
         }
 
         _ => {}
@@ -1975,6 +2377,76 @@ fn common_prefix(strings: &[String]) -> String {
         }
     }
     first[..len].to_string()
+}
+
+/// Copy text to the system clipboard via pbcopy (macOS).
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if let Ok(mut child) = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// Extract a mention query from the input at the cursor position.
+/// Returns (byte_offset_of_@, query_after_@) if an active @query is found.
+fn extract_mention_query(input: &str, cursor_pos: usize) -> Option<(usize, String)> {
+    let before = &input[..cursor_pos];
+    if let Some(at_pos) = before.rfind('@') {
+        let query = &before[at_pos + 1..];
+        // Only trigger if all chars after @ are word-like (no spaces)
+        if query.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+            // Don't trigger inside <@U123> (already-formatted mentions)
+            if at_pos > 0 && &input[at_pos - 1..at_pos] == "<" {
+                return None;
+            }
+            return Some((at_pos, query.to_string()));
+        }
+    }
+    None
+}
+
+/// Update the mention autocomplete state based on current input and cursor position.
+fn update_mention_state(app: &mut App) {
+    if let Some((_at_pos, query)) = extract_mention_query(&app.input, app.cursor_pos) {
+        app.mention_query = query;
+        app.mention_active = true;
+        update_mention_results(app);
+    } else {
+        app.mention_active = false;
+        app.mention_query.clear();
+        app.mention_results.clear();
+        app.mention_selected = 0;
+    }
+}
+
+/// Update the mention results list based on the current query.
+fn update_mention_results(app: &mut App) {
+    let query = app.mention_query.to_lowercase();
+    let mut results: Vec<(String, String)> = app
+        .user_cache
+        .iter()
+        .filter(|(id, name)| {
+            // Filter out bots (B-prefixed IDs) and self
+            id.starts_with('U')
+                && **id != app.current_user_id
+                && name.to_lowercase().contains(&query)
+        })
+        .map(|(id, name)| (id.clone(), name.clone()))
+        .collect();
+    results.sort_by(|a, b| a.1.cmp(&b.1));
+    results.truncate(15);
+    app.mention_results = results;
+    app.mention_selected = 0;
 }
 
 /// Hide the thread pane if the currently selected message has no replies.

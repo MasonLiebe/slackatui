@@ -596,14 +596,16 @@ mod tests {
             text: "check this".into(),
             files: vec![SlackFile {
                 id: "F1".into(),
-                title: "report.pdf".into(),
+                name: "report.pdf".into(),
+                title: "report".into(),
+                filetype: "pdf".into(),
                 mimetype: "application/pdf".into(),
                 url_private: "https://example.com/report.pdf".into(),
             }],
             ..Default::default()
         };
         let content = svc.format_message_content(&sm);
-        assert!(content.contains("[file: report.pdf]"));
+        assert!(content.contains("[file: report]"));
     }
 
 

@@ -207,8 +207,14 @@ fn default_keymap() -> HashMap<String, KeyMapping> {
     command.insert("u".into(), "upload-file".into());
     command.insert("p".into(), "toggle-presence".into());
     command.insert("d".into(), "download-file".into());
+    command.insert("y".into(), "yank".into());
+    command.insert("x".into(), "delete-message".into());
+    command.insert("E".into(), "edit-message".into());
+    command.insert("m".into(), "toggle-members".into());
+    command.insert("S".into(), "mode-msg-search".into());
     command.insert("q".into(), "quit".into());
     command.insert("<f1>".into(), "help".into());
+    command.insert("?".into(), "help".into());
     key_map.insert("command".into(), command);
 
     let mut insert = KeyMapping::new();

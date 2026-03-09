@@ -2,6 +2,7 @@
 
 mod auth;
 mod config;
+mod highlight;
 mod parse;
 mod service;
 mod slack;

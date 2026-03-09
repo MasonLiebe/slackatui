@@ -115,6 +115,7 @@ pub enum Mode {
     Command,
     Insert,
     Search,
+    MessageSearch,
     React,
     Upload,
     Download,

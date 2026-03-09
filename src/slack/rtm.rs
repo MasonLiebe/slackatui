@@ -12,6 +12,7 @@ use super::SlackClient;
 pub enum RtmEvent {
     Message(MessageEvent),
     PresenceChange(PresenceChangeEvent),
+    UserTyping(UserTypingEvent),
     Error(String),
     Connected,
     Disconnected,
@@ -64,6 +65,13 @@ pub struct SubMessage {
 pub struct PresenceChangeEvent {
     pub user: String,
     pub presence: String,
+}
+
+/// A user typing event from the RTM stream.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserTypingEvent {
+    pub channel: String,
+    pub user: String,
 }
 
 /// Raw RTM envelope — we just need the type field to dispatch.
@@ -196,7 +204,11 @@ fn parse_rtm_event(text: &str) -> Option<RtmEvent> {
             let err: RtmError = serde_json::from_str(text).ok()?;
             Some(RtmEvent::Error(err.error.msg))
         }
-        // hello, user_typing, etc. — ignored
+        "user_typing" => {
+            let ev: UserTypingEvent = serde_json::from_str(text).ok()?;
+            Some(RtmEvent::UserTyping(ev))
+        }
+        // hello, etc. — ignored
         _ => None,
     }
 }
@@ -377,10 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_user_typing_ignored() {
+    fn test_parse_user_typing() {
         let json = r#"{"type": "user_typing", "channel": "C123", "user": "U456"}"#;
-        let event = parse_rtm_event(json);
-        assert!(event.is_none());
+        let event = parse_rtm_event(json).unwrap();
+        match event {
+            RtmEvent::UserTyping(ev) => {
+                assert_eq!(ev.channel, "C123");
+                assert_eq!(ev.user, "U456");
+            }
+            _ => panic!("expected UserTyping event"),
+        }
     }
 
     #[test]

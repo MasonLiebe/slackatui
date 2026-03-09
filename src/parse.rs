@@ -504,6 +504,9 @@ pub struct StyledSegment {
     pub italic: bool,
     pub strikethrough: bool,
     pub code: bool,
+    pub code_block: bool,
+    pub code_language: String,
+    pub mention: bool,
 }
 
 impl StyledSegment {
@@ -514,18 +517,21 @@ impl StyledSegment {
             italic: false,
             strikethrough: false,
             code: false,
+            code_block: false,
+            code_language: String::new(),
+            mention: false,
         }
     }
 }
 
 static MRKDWN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Match code blocks, inline code, bold, italic, strikethrough
+    // Match code blocks (with optional language), inline code, bold, italic, strikethrough, @mentions
     // Order matters: longer/greedy patterns first
-    Regex::new(r"(?s)```(.*?)```|`([^`]+)`|\*([^*]+)\*|_([^_]+)_|~([^~]+)~").unwrap()
+    Regex::new(r"(?s)```(\w*)\n?(.*?)```|`([^`]+)`|\*([^*]+)\*|_([^_]+)_|~([^~]+)~|(@[\w.\-]+)").unwrap()
 });
 
 /// Parse Slack mrkdwn formatting into styled segments.
-/// Handles: `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``, `\`\`\`code blocks\`\`\``
+/// Handles: `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``, `\`\`\`code blocks\`\`\``, `@mentions`
 pub fn parse_mrkdwn(text: &str) -> Vec<StyledSegment> {
     let mut segments = Vec::new();
     let mut last_end = 0;
@@ -536,34 +542,44 @@ pub fn parse_mrkdwn(text: &str) -> Vec<StyledSegment> {
             segments.push(StyledSegment::plain(text[last_end..m.start()].to_string()));
         }
 
-        if let Some(code_block) = caps.get(1) {
+        if let Some(code_body) = caps.get(2) {
+            // Fenced code block: ```lang\ncode```
+            let lang = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             segments.push(StyledSegment {
-                text: code_block.as_str().to_string(),
+                text: code_body.as_str().to_string(),
                 code: true,
+                code_block: true,
+                code_language: lang.to_string(),
                 ..StyledSegment::plain(String::new())
             });
-        } else if let Some(inline_code) = caps.get(2) {
+        } else if let Some(inline_code) = caps.get(3) {
             segments.push(StyledSegment {
                 text: inline_code.as_str().to_string(),
                 code: true,
                 ..StyledSegment::plain(String::new())
             });
-        } else if let Some(bold) = caps.get(3) {
+        } else if let Some(bold) = caps.get(4) {
             segments.push(StyledSegment {
                 text: bold.as_str().to_string(),
                 bold: true,
                 ..StyledSegment::plain(String::new())
             });
-        } else if let Some(italic) = caps.get(4) {
+        } else if let Some(italic) = caps.get(5) {
             segments.push(StyledSegment {
                 text: italic.as_str().to_string(),
                 italic: true,
                 ..StyledSegment::plain(String::new())
             });
-        } else if let Some(strike) = caps.get(5) {
+        } else if let Some(strike) = caps.get(6) {
             segments.push(StyledSegment {
                 text: strike.as_str().to_string(),
                 strikethrough: true,
+                ..StyledSegment::plain(String::new())
+            });
+        } else if let Some(mention) = caps.get(7) {
+            segments.push(StyledSegment {
+                text: mention.as_str().to_string(),
+                mention: true,
                 ..StyledSegment::plain(String::new())
             });
         }
@@ -893,10 +909,41 @@ mod tests {
 
     #[test]
     fn test_mrkdwn_code_block() {
+        // ```fn main() {}``` — "fn" is captured as language, " main() {}" as body
         let segs = parse_mrkdwn("```fn main() {}```");
         assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].text, "fn main() {}");
         assert!(segs[0].code);
+        assert!(segs[0].code_block);
+        assert_eq!(segs[0].code_language, "fn");
+        assert_eq!(segs[0].text, " main() {}");
+    }
+
+    #[test]
+    fn test_mrkdwn_code_block_no_language() {
+        let segs = parse_mrkdwn("```\nhello world\n```");
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].code_block);
+        assert_eq!(segs[0].code_language, "");
+        assert_eq!(segs[0].text, "hello world\n");
+    }
+
+    #[test]
+    fn test_mrkdwn_code_block_with_language() {
+        let segs = parse_mrkdwn("```rust\nfn main() {}\n```");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "fn main() {}\n");
+        assert!(segs[0].code_block);
+        assert_eq!(segs[0].code_language, "rust");
+    }
+
+    #[test]
+    fn test_mrkdwn_mention() {
+        let segs = parse_mrkdwn("hello @alice and @bob");
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[1].text, "@alice");
+        assert!(segs[1].mention);
+        assert_eq!(segs[3].text, "@bob");
+        assert!(segs[3].mention);
     }
 
     #[test]

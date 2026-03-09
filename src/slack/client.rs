@@ -342,6 +342,62 @@ impl SlackClient {
         Ok(all)
     }
 
+    // ---- conversations.members ----
+
+    /// Fetch all members of a conversation, with pagination.
+    pub async fn get_conversation_members(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<String>, SlackError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            members: Vec<String>,
+            #[serde(default)]
+            response_metadata: Option<ResponseMetadata>,
+        }
+
+        let mut all = Vec::new();
+        let mut cursor = String::new();
+
+        loop {
+            let mut params = vec![("channel", channel_id), ("limit", "200")];
+            if !cursor.is_empty() {
+                params.push(("cursor", &cursor));
+            }
+            let resp: Resp = self.get("conversations.members", &params).await?;
+            all.extend(resp.members);
+            match resp.response_metadata {
+                Some(meta) if !meta.next_cursor.is_empty() => cursor = meta.next_cursor,
+                _ => break,
+            }
+        }
+
+        Ok(all)
+    }
+
+    // ---- search.messages ----
+
+    /// Search messages across all channels.
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        count: u32,
+    ) -> Result<Vec<SearchMatch>, SlackError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            messages: SearchMessages,
+        }
+        #[derive(Deserialize)]
+        struct SearchMessages {
+            matches: Vec<SearchMatch>,
+        }
+
+        let count_str = count.to_string();
+        let params = [("query", query), ("count", &count_str), ("sort", "timestamp")];
+        let resp: Resp = self.get("search.messages", &params).await?;
+        Ok(resp.messages.matches)
+    }
+
     // ---- Mark as read ----
 
     /// Mark a conversation as read up to the current time.
@@ -461,6 +517,44 @@ impl SlackClient {
                     "channel": channel_id,
                     "timestamp": timestamp,
                     "name": emoji_name,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a message.
+    pub async fn delete_message(
+        &self,
+        channel_id: &str,
+        timestamp: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_json(
+                "chat.delete",
+                &serde_json::json!({
+                    "channel": channel_id,
+                    "ts": timestamp,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Edit a message.
+    pub async fn update_message(
+        &self,
+        channel_id: &str,
+        timestamp: &str,
+        text: &str,
+    ) -> Result<(), SlackError> {
+        let _: SlackEnvelope = self
+            .post_json(
+                "chat.update",
+                &serde_json::json!({
+                    "channel": channel_id,
+                    "ts": timestamp,
+                    "text": text,
                 }),
             )
             .await?;
@@ -779,6 +873,30 @@ pub struct SlackReaction {
     pub count: u32,
     #[serde(default)]
     pub users: Vec<String>,
+}
+
+/// A search result match from search.messages.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchMatch {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub channel: SearchChannel,
+    #[serde(default)]
+    pub permalink: String,
+}
+
+/// Channel info within a search result.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SearchChannel {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// A Slack message attachment.

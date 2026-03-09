@@ -35,6 +35,7 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "files:write",
     "users.profile:read",
     "users.profile:write",
+    "search:read",
 ];
 
 /// Configuration for the OAuth v2 flow.

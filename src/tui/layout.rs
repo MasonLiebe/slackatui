@@ -4,8 +4,39 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wr
 use ratatui_image::StatefulImage;
 
 use super::App;
+use crate::highlight;
 use crate::parse;
 use crate::types::{Focus, Mode};
+
+/// 20 distinct colors for member names. After 20 members, colors repeat.
+const MEMBER_COLORS: [Color; 20] = [
+    Color::Rgb(220, 120, 120), // soft red
+    Color::Rgb(120, 200, 120), // green
+    Color::Rgb(100, 160, 240), // blue
+    Color::Rgb(240, 180, 80),  // orange
+    Color::Rgb(180, 120, 220), // purple
+    Color::Rgb(80, 200, 200),  // teal
+    Color::Rgb(240, 140, 180), // pink
+    Color::Rgb(160, 220, 100), // lime
+    Color::Rgb(200, 160, 120), // tan
+    Color::Rgb(140, 180, 220), // steel blue
+    Color::Rgb(220, 200, 80),  // yellow
+    Color::Rgb(180, 140, 180), // mauve
+    Color::Rgb(100, 220, 180), // mint
+    Color::Rgb(220, 140, 100), // coral
+    Color::Rgb(160, 140, 220), // lavender
+    Color::Rgb(180, 220, 160), // sage
+    Color::Rgb(220, 180, 160), // peach
+    Color::Rgb(120, 180, 160), // seafoam
+    Color::Rgb(200, 120, 180), // rose
+    Color::Rgb(160, 200, 220), // sky
+];
+
+/// Deterministic color for a username.
+fn member_color(name: &str) -> Color {
+    let hash = name.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    MEMBER_COLORS[(hash % 20) as usize]
+}
 
 const LOGO: &[&str] = &[
     r"     _            _         _         _ ",
@@ -385,8 +416,8 @@ fn border_color(app: &App, pane: Focus) -> Color {
     }
 }
 
-/// Convert message content into styled spans using mrkdwn parsing.
-fn content_spans(content: &str) -> Vec<Span<'_>> {
+/// Convert a single line of message content into styled spans (no code blocks).
+fn content_spans(content: &str) -> Vec<Span<'static>> {
     let segments = parse::parse_mrkdwn(content);
     segments
         .into_iter()
@@ -402,11 +433,104 @@ fn content_spans(content: &str) -> Vec<Span<'_>> {
                 style = style.add_modifier(Modifier::CROSSED_OUT);
             }
             if seg.code {
-                style = style.fg(Color::Rgb(220, 170, 80)).bg(Color::Rgb(40, 40, 50));
+                style = style
+                    .fg(Color::Rgb(220, 170, 80))
+                    .bg(Color::Rgb(40, 44, 52));
+            }
+            if seg.mention {
+                style = style
+                    .fg(Color::Rgb(80, 160, 220))
+                    .add_modifier(Modifier::BOLD);
             }
             Span::styled(seg.text, style)
         })
         .collect()
+}
+
+/// Build styled Lines from full message content, handling code blocks with syntax highlighting.
+/// `width` is the available terminal columns for the content area.
+fn build_content_lines(
+    content: &str,
+    sel_bg: Option<Color>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let style_with_bg = |s: Style| -> Style {
+        if let Some(bg) = sel_bg {
+            s.bg(bg)
+        } else {
+            s
+        }
+    };
+
+    let segments = parse::parse_mrkdwn(content);
+    let mut result: Vec<Line<'static>> = Vec::new();
+    // Accumulate inline spans for the current line
+    let mut current_spans: Vec<Span<'static>> = vec![
+        Span::styled("  ", style_with_bg(Style::default()))
+    ];
+
+    for seg in segments {
+        if seg.code_block {
+            // Flush any accumulated inline spans as a line
+            if current_spans.len() > 1 {
+                result.push(Line::from(std::mem::take(&mut current_spans)));
+                current_spans.push(Span::styled("  ", style_with_bg(Style::default())));
+            }
+            // Render syntax-highlighted code block in a box
+            // Box width = available width minus the 2-char indent
+            let box_width = width.saturating_sub(2);
+            result.push(highlight::code_block_header(&seg.code_language, box_width));
+            let highlighted = highlight::highlight_code(&seg.text, &seg.code_language, box_width);
+            result.extend(highlighted);
+            result.push(highlight::code_block_footer(box_width));
+        } else {
+            // Handle segments that may contain newlines
+            let sub_lines: Vec<&str> = seg.text.split('\n').collect();
+            for (i, sub_line) in sub_lines.iter().enumerate() {
+                if i > 0 {
+                    // End current line, start new one
+                    result.push(Line::from(std::mem::take(&mut current_spans)));
+                    current_spans.push(Span::styled("  ", style_with_bg(Style::default())));
+                }
+                if !sub_line.is_empty() {
+                    let mut style = Style::default();
+                    if seg.bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if seg.italic {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if seg.strikethrough {
+                        style = style.add_modifier(Modifier::CROSSED_OUT);
+                    }
+                    if seg.code {
+                        style = style
+                            .fg(Color::Rgb(220, 170, 80))
+                            .bg(Color::Rgb(40, 44, 52));
+                    }
+                    if seg.mention {
+                        style = style
+                            .fg(Color::Rgb(80, 160, 220))
+                            .add_modifier(Modifier::BOLD);
+                    }
+                    current_spans.push(Span::styled(
+                        sub_line.to_string(),
+                        style_with_bg(style),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Flush remaining spans
+    if current_spans.len() > 1 {
+        result.push(Line::from(current_spans));
+    } else if result.is_empty() {
+        // Empty content - push at least one line with indent
+        result.push(Line::from(current_spans));
+    }
+
+    result
 }
 
 /// Render the entire application UI.
@@ -425,16 +549,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Sidebar uses fixed character width for readability
     let sidebar_chars = 16 + (app.config.sidebar_width as u16) * 4;
 
-    let constraints = if app.thread_visible {
+    let mut constraints = vec![
+        Constraint::Length(sidebar_chars),
+        Constraint::Min(20),
+    ];
+    if app.thread_visible {
         let thread_chars = 16 + (app.config.threads_width as u16) * 4;
-        vec![
-            Constraint::Length(sidebar_chars),
-            Constraint::Min(20),
-            Constraint::Length(thread_chars),
-        ]
-    } else {
-        vec![Constraint::Length(sidebar_chars), Constraint::Min(20)]
-    };
+        constraints.push(Constraint::Length(thread_chars));
+    }
+    if app.members_visible {
+        constraints.push(Constraint::Length(22));
+    }
 
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
@@ -444,8 +569,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_channels(frame, app, horizontal[0]);
     render_chat(frame, app, horizontal[1]);
 
-    if app.thread_visible && horizontal.len() > 2 {
-        render_threads(frame, app, horizontal[2]);
+    let mut next_panel = 2;
+    if app.thread_visible && horizontal.len() > next_panel {
+        render_threads(frame, app, horizontal[next_panel]);
+        next_panel += 1;
+    }
+    if app.members_visible && horizontal.len() > next_panel {
+        render_members(frame, app, horizontal[next_panel]);
     }
 
     render_status(frame, app, status_area);
@@ -453,6 +583,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Reaction picker overlay
     if app.mode == Mode::React {
         render_react_picker(frame, app, size);
+    }
+
+    // Mention autocomplete overlay
+    if app.mode == Mode::Insert && app.mention_active && !app.mention_results.is_empty() {
+        render_mention_popup(frame, app, size);
+    }
+
+    // Message search results overlay
+    if app.mode == Mode::MessageSearch && !app.msg_search_results.is_empty() {
+        render_msg_search(frame, app, size);
+    }
+
+    // Help popup overlay
+    if app.help_visible {
+        render_help_popup(frame, size);
     }
 }
 
@@ -546,17 +691,43 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         0
     };
 
+    // Check if anyone is typing in the current channel
+    let current_ch_id = app.current_channel().map(|c| c.id.as_str());
+    let typing_names: Vec<String> = app
+        .typing_users
+        .iter()
+        .filter(|(_, (ch, _))| current_ch_id == Some(ch.as_str()))
+        .map(|(uid, _)| app.user_cache.get(uid).cloned().unwrap_or_else(|| uid.clone()))
+        .collect();
+    let typing_height: u16 = if typing_names.is_empty() { 0 } else { 1 };
+
     let chat_split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(input_height)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(typing_height),
+            Constraint::Length(input_height),
+        ])
         .split(inner);
 
     let msg_area = chat_split[0];
 
     render_messages(frame, app, msg_area);
 
+    // Typing indicator
+    if !typing_names.is_empty() {
+        let text = if typing_names.len() == 1 {
+            format!("  {} is typing…", typing_names[0])
+        } else {
+            format!("  {} are typing…", typing_names.join(", "))
+        };
+        let typing_line = Paragraph::new(text)
+            .style(Style::default().fg(Color::Rgb(120, 120, 150)).add_modifier(Modifier::ITALIC));
+        frame.render_widget(typing_line, chat_split[1]);
+    }
+
     if app.mode == Mode::Insert {
-        render_input_box(frame, app, chat_split[1]);
+        render_input_box(frame, app, chat_split[2]);
     }
 }
 
@@ -603,6 +774,7 @@ fn build_message_lines<'a>(
     is_selected: bool,
     show_header: bool,
     image_cache_keys: &std::collections::HashSet<String>,
+    width: usize,
 ) -> (Vec<Line<'a>>, Vec<(usize, String)>) {
     let sel_bg = if is_selected {
         Some(Color::Rgb(50, 50, 70))
@@ -629,7 +801,7 @@ fn build_message_lines<'a>(
                 msg.name.clone(),
                 style_with_bg(
                     Style::default()
-                        .fg(Color::Rgb(220, 220, 240))
+                        .fg(member_color(&msg.name))
                         .add_modifier(Modifier::BOLD),
                 ),
             ),
@@ -640,45 +812,33 @@ fn build_message_lines<'a>(
         ]));
     }
 
-    // Content lines, indented
-    let content_lines: Vec<&str> = msg.content.split('\n').collect();
-    for (line_idx, content_line) in content_lines.iter().enumerate() {
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled("  ", style_with_bg(Style::default())));
+    // Content lines, with rich formatting and syntax-highlighted code blocks
+    let mut content_lines = build_content_lines(&msg.content, sel_bg, width);
 
-        for seg_span in content_spans(content_line) {
-            spans.push(Span::styled(
-                seg_span.content,
-                style_with_bg(seg_span.style),
+    // Reply indicator on the last content line
+    if let Some(last_line) = content_lines.last_mut() {
+        if msg.reply_count > 0 {
+            let reply_text = if msg.reply_count == 1 {
+                " ↳ 1 reply".to_string()
+            } else {
+                format!(" ↳ {} replies", msg.reply_count)
+            };
+            last_line.spans.push(Span::styled(
+                reply_text,
+                style_with_bg(
+                    Style::default()
+                        .fg(Color::Rgb(80, 160, 220))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ));
+        } else if !msg.thread.is_empty() {
+            last_line.spans.push(Span::styled(
+                " ↳ thread",
+                style_with_bg(Style::default().fg(Color::Rgb(100, 100, 130))),
             ));
         }
-
-        // Reply indicator on the last content line
-        if line_idx == content_lines.len() - 1 {
-            if msg.reply_count > 0 {
-                let reply_text = if msg.reply_count == 1 {
-                    " ↳ 1 reply".to_string()
-                } else {
-                    format!(" ↳ {} replies", msg.reply_count)
-                };
-                spans.push(Span::styled(
-                    reply_text,
-                    style_with_bg(
-                        Style::default()
-                            .fg(Color::Rgb(80, 160, 220))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ));
-            } else if !msg.thread.is_empty() {
-                spans.push(Span::styled(
-                    " ↳ thread",
-                    style_with_bg(Style::default().fg(Color::Rgb(100, 100, 130))),
-                ));
-            }
-        }
-
-        result.push(Line::from(spans));
     }
+    result.extend(content_lines);
 
     // Inline images: insert placeholder blank lines for cached images
     let mut image_placeholders = Vec::new();
@@ -766,7 +926,7 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let start = all_lines.len();
-        let (lines, placeholders) = build_message_lines(msg, is_selected, !grouped, &cached_keys);
+        let (lines, placeholders) = build_message_lines(msg, is_selected, !grouped, &cached_keys, width);
         // Map relative placeholder offsets to absolute line positions
         for (offset, file_id) in placeholders {
             image_positions.push((start + offset, file_id));
@@ -945,7 +1105,7 @@ fn render_threads(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::default());
         }
         let start = lines.len();
-        let (msg_lines, placeholders) = build_message_lines(msg, false, !grouped, &cached_keys);
+        let (msg_lines, placeholders) = build_message_lines(msg, false, !grouped, &cached_keys, inner.width as usize);
         for (offset, file_id) in placeholders {
             image_positions.push((start + offset, file_id));
         }
@@ -996,16 +1156,81 @@ fn render_threads(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Render the members list panel.
+fn render_members(frame: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" Members ({}) ", app.members.len());
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Rgb(100, 200, 140))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+        .border_type(BorderType::Rounded);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .members
+        .iter()
+        .map(|(uid, name)| {
+            let color = member_color(name);
+            let presence = app
+                .channels
+                .iter()
+                .find(|c| c.user_id == *uid)
+                .map(|c| c.presence.as_str())
+                .unwrap_or("");
+            let icon = if presence == "active" { "● " } else { "  " };
+            let mut spans = vec![
+                Span::styled(
+                    icon,
+                    Style::default().fg(if presence == "active" {
+                        Color::Rgb(80, 200, 120)
+                    } else {
+                        Color::Rgb(60, 60, 80)
+                    }),
+                ),
+                Span::styled(name.clone(), Style::default().fg(color)),
+            ];
+            // Mark current user
+            if *uid == app.current_user_id {
+                spans.push(Span::styled(
+                    " (you)",
+                    Style::default().fg(Color::Rgb(100, 100, 120)),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items);
+    frame.render_widget(list, inner);
+}
+
 /// Render the status bar at the bottom.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let content = match app.mode {
         Mode::Insert => {
+            let is_editing = app.editing_ts.is_some();
+            let (badge, badge_bg) = if is_editing {
+                (" EDITING ", Color::Rgb(220, 160, 50))
+            } else {
+                (" INSERT ", Color::Rgb(100, 200, 140))
+            };
             let mut spans = vec![
                 Span::styled(
-                    " INSERT ",
+                    badge,
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Rgb(100, 200, 140))
+                        .bg(badge_bg)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -1013,6 +1238,11 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(
                     format!(" {}", &app.status),
                     Style::default().fg(Color::Rgb(180, 140, 60)),
+                ));
+            } else if is_editing {
+                spans.push(Span::styled(
+                    " Enter to save, Escape to cancel",
+                    Style::default().fg(Color::Rgb(100, 100, 120)),
                 ));
             } else {
                 spans.push(Span::styled(
@@ -1047,6 +1277,42 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(&app.search_input),
             Span::styled("\u{258e}", Style::default().fg(Color::Rgb(220, 180, 50))),
         ]),
+        Mode::MessageSearch => {
+            let mut spans = vec![
+                Span::styled(
+                    " MSG SEARCH ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(180, 120, 220))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ", Style::default()),
+                Span::raw(&app.msg_search_query),
+                Span::styled("\u{258e}", Style::default().fg(Color::Rgb(180, 120, 220))),
+            ];
+            if app.msg_search_loading {
+                spans.push(Span::styled(
+                    "  searching...",
+                    Style::default().fg(Color::Rgb(140, 140, 160)).add_modifier(Modifier::ITALIC),
+                ));
+            } else if !app.msg_search_results.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}/{} j/k=nav Enter=go", app.msg_search_selected + 1, app.msg_search_results.len()),
+                    Style::default().fg(Color::Rgb(140, 140, 160)),
+                ));
+            } else if !app.status.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", &app.status),
+                    Style::default().fg(Color::Rgb(180, 140, 60)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "  Enter=search, Esc=cancel",
+                    Style::default().fg(Color::Rgb(100, 100, 120)),
+                ));
+            }
+            Line::from(spans)
+        }
         Mode::Upload => Line::from(vec![
             Span::styled(
                 " UPLOAD ",
@@ -1167,8 +1433,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                     spans.push(Span::styled("d", Style::default().fg(Color::Rgb(100, 180, 220))));
                     spans.push(Span::styled("=download ", Style::default().fg(Color::Rgb(100, 180, 220))));
                 }
-                spans.push(Span::styled("u", Style::default().fg(Color::White)));
-                spans.push(Span::styled("=upload ", Style::default().fg(Color::Rgb(100, 100, 120))));
+                spans.push(Span::styled("y", Style::default().fg(Color::White)));
+                spans.push(Span::styled("=copy ", Style::default().fg(Color::Rgb(100, 100, 120))));
                 spans.push(Span::styled("j/k", Style::default().fg(Color::White)));
                 spans.push(Span::styled("=nav ", Style::default().fg(Color::Rgb(100, 100, 120))));
                 spans.push(Span::styled("h", Style::default().fg(Color::White)));
@@ -1192,6 +1458,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("=quit ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     Span::styled("p", Style::default().fg(Color::White)),
                     Span::styled("=presence ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled("?", Style::default().fg(Color::White)),
+                    Span::styled("=help ", Style::default().fg(Color::Rgb(100, 100, 120))),
                     presence_span,
                 ])
             }
@@ -1201,6 +1469,223 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let bar = Paragraph::new(content)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)).fg(Color::White));
     frame.render_widget(bar, area);
+}
+
+/// Render the message search results popup.
+fn render_msg_search(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let popup_width = 70u16.min(area.width.saturating_sub(6));
+    let popup_height = 22u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" Search: {} ({} results) ", app.msg_search_query, app.msg_search_results.len());
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Rgb(180, 120, 220))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(180, 120, 220)))
+        .border_type(BorderType::Rounded);
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner.height == 0 || inner.width < 10 {
+        return;
+    }
+
+    let content_width = inner.width as usize;
+    let max_visible = inner.height as usize;
+
+    // Scroll to keep selected item visible
+    let scroll = if app.msg_search_selected >= max_visible {
+        app.msg_search_selected - max_visible + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, result) in app.msg_search_results.iter().enumerate().skip(scroll) {
+        if lines.len() >= max_visible {
+            break;
+        }
+
+        let is_selected = i == app.msg_search_selected;
+        let bg = if is_selected {
+            Some(Color::Rgb(50, 40, 70))
+        } else {
+            None
+        };
+
+        let style_with_bg = |s: Style| -> Style {
+            if let Some(bg) = bg { s.bg(bg) } else { s }
+        };
+
+        // Header: #channel  username  time
+        let time = crate::service::parse_slack_timestamp(&result.ts);
+        let time_str = time.format("%-m/%-d %-I:%M%p").to_string();
+        let channel_name = if result.channel.name.is_empty() {
+            "DM".to_string()
+        } else {
+            format!("#{}", result.channel.name)
+        };
+
+        let sel_indicator = if is_selected { "▸ " } else { "  " };
+
+        lines.push(Line::from(vec![
+            Span::styled(sel_indicator, style_with_bg(Style::default().fg(Color::Rgb(180, 120, 220)))),
+            Span::styled(
+                channel_name,
+                style_with_bg(Style::default().fg(Color::Rgb(100, 200, 140)).add_modifier(Modifier::BOLD)),
+            ),
+            Span::styled("  ", style_with_bg(Style::default())),
+            Span::styled(
+                result.username.clone(),
+                style_with_bg(Style::default().fg(member_color(&result.username)).add_modifier(Modifier::BOLD)),
+            ),
+            Span::styled(
+                format!("  {}", time_str),
+                style_with_bg(Style::default().fg(Color::Rgb(100, 100, 120))),
+            ),
+        ]));
+
+        // Message preview (truncated to fit)
+        if lines.len() < max_visible {
+            let preview_max = content_width.saturating_sub(4);
+            let text = result.text.replace('\n', " ");
+            let preview: String = text.chars().take(preview_max).collect();
+            lines.push(Line::from(vec![
+                Span::styled("    ", style_with_bg(Style::default())),
+                Span::styled(preview, style_with_bg(Style::default().fg(Color::Rgb(180, 180, 200)))),
+            ]));
+        }
+
+        // Separator between results
+        if lines.len() < max_visible {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(content_width),
+                Style::default().fg(Color::Rgb(45, 45, 60)),
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+/// Render the help popup showing all keybindings.
+fn render_help_popup(frame: &mut Frame, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let help_sections: &[(&str, &[(&str, &str)])] = &[
+        ("Navigation", &[
+            ("j / k", "Channel up / down"),
+            ("l / h", "Focus right / left"),
+            ("Ctrl+u / Ctrl+d", "Scroll chat up / down"),
+            ("g / G", "Jump to top / bottom"),
+            ("'", "Open thread"),
+            ("/", "Search channels"),
+            ("S", "Search messages"),
+            ("n / N", "Next / prev search match"),
+        ]),
+        ("Messaging", &[
+            ("i", "Insert mode (type a message)"),
+            ("r", "Reply in thread"),
+            ("e", "React with emoji"),
+            ("E", "Edit your message"),
+            ("x", "Delete your message"),
+            ("y", "Copy message to clipboard"),
+        ]),
+        ("Insert Mode", &[
+            ("Enter", "Send message"),
+            ("Shift+Enter", "New line"),
+            ("Escape", "Back to command mode"),
+            ("@user + Tab", "Mention autocomplete"),
+            ("Ctrl+b / Ctrl+i", "Bold / italic"),
+        ]),
+        ("Files", &[
+            ("o", "Open file / image"),
+            ("d", "Download file (Tab to complete)"),
+            ("u", "Upload file"),
+        ]),
+        ("Panels & Status", &[
+            ("m", "Toggle member list"),
+            ("p", "Toggle presence (active/away)"),
+            ("F1 / ?", "Toggle this help"),
+            ("q", "Quit"),
+        ]),
+    ];
+
+    // Calculate popup size
+    let content_height: u16 = help_sections
+        .iter()
+        .map(|(_, items)| 1 + items.len() as u16 + 1) // header + items + spacing
+        .sum::<u16>()
+        .saturating_sub(1); // no trailing space on last section
+
+    let popup_width = 48u16.min(area.width.saturating_sub(4));
+    let popup_height = (content_height + 2).min(area.height.saturating_sub(2)); // +2 for borders
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" Help ")
+        .title_style(
+            Style::default()
+                .fg(Color::Rgb(100, 200, 140))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(100, 200, 140)))
+        .border_type(BorderType::Rounded);
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner.height == 0 || inner.width < 10 {
+        return;
+    }
+
+    let key_width = 18;
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (si, (section, items)) in help_sections.iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", section),
+            Style::default()
+                .fg(Color::Rgb(100, 200, 140))
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (key, desc) in *items {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:width$}", key, width = key_width),
+                    Style::default().fg(Color::Rgb(220, 180, 80)),
+                ),
+                Span::styled(
+                    (*desc).to_string(),
+                    Style::default().fg(Color::Rgb(180, 180, 200)),
+                ),
+            ]));
+        }
+        if si < help_sections.len() - 1 {
+            lines.push(Line::default());
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }
 
 /// Render the emoji reaction picker as a centered popup.
@@ -1270,6 +1755,64 @@ fn render_react_picker(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines), results_area);
+}
+
+/// Render the @mention autocomplete popup above the input box.
+fn render_mention_popup(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let max_items = app.mention_results.len().min(8) as u16;
+    let popup_width = 30u16.min(area.width.saturating_sub(4));
+    let popup_height = (max_items + 2).min(area.height.saturating_sub(4)); // +2 for border
+
+    // Position above the status bar, left-aligned with some indent
+    let x = area.width.saturating_sub(popup_width) / 3;
+    let y = area.height.saturating_sub(popup_height + 2); // above status bar
+
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" @{} ", app.mention_query);
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Rgb(80, 160, 220))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(80, 160, 220)))
+        .border_type(BorderType::Rounded);
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner.height == 0 || inner.width < 3 {
+        return;
+    }
+
+    let max_visible = inner.height as usize;
+    let scroll = if app.mention_selected >= max_visible {
+        app.mention_selected - max_visible + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (_user_id, name)) in app.mention_results.iter().enumerate().skip(scroll).take(max_visible) {
+        let is_sel = i == app.mention_selected;
+        let style = if is_sel {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(50, 60, 90))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(180, 180, 200))
+        };
+        lines.push(Line::from(Span::styled(format!(" @{}", name), style)));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
