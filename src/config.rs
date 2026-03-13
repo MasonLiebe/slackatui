@@ -419,7 +419,7 @@ pub fn run_config_wizard() {
 
     let redirect_uri = prompt_default(
         "    Redirect URI",
-        if existing.auth.redirect_uri.is_empty() { "https://localhost:8888/auth/callback" } else { &existing.auth.redirect_uri },
+        if existing.auth.redirect_uri.is_empty() { "https://localhost:8888/callback" } else { &existing.auth.redirect_uri },
     );
 
     // ── Token storage ──

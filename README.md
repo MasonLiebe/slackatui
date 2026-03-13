@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD033 -->
+
 # slackatui
 
 A Slack client for your terminal, built with Rust and [ratatui](https://ratatui.rs).
@@ -64,12 +66,22 @@ cp target/release/slackatui ~/.local/bin/
 
 ### 3. Create a Slack App
 
-You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App** > **From scratch**.
+You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**.
 
-1. **Name your app** (e.g. "slackatui") and select your workspace
-2. Go to **OAuth & Permissions** in the sidebar
-3. Under **Redirect URLs**, add: `https://localhost:8888`
-4. Under **User Token Scopes**, add these scopes:
+#### Option A: From an app manifest (recommended)
+
+1. Select **From an app manifest**
+2. Select your workspace
+3. Paste the contents of [`manifest.json`](manifest.json) from this repo and click through to create the app
+4. Note your **Client ID** and **Client Secret** from the **Basic Information** page (under "App Credentials")
+
+#### Option B: Manual setup
+
+1. Select **From scratch**
+2. **Name your app** (e.g. "slackatui") and select your workspace
+3. Go to **OAuth & Permissions** in the sidebar
+4. Under **Redirect URLs**, add: `https://localhost:8888/callback`
+5. Under **User Token Scopes**, add these scopes:
    - `channels:read`, `channels:history`, `channels:write`
    - `groups:read`, `groups:history`, `groups:write`
    - `im:read`, `im:history`, `im:write`
@@ -79,7 +91,8 @@ You need a Slack App to authenticate. Go to [api.slack.com/apps](https://api.sla
    - `reactions:read`, `reactions:write`
    - `files:read`, `files:write`
    - `users.profile:read`, `users.profile:write`
-5. Note your **Client ID** and **Client Secret** from the **Basic Information** page (under "App Credentials")
+   - `search:read`
+6. Note your **Client ID** and **Client Secret** from the **Basic Information** page (under "App Credentials")
 
 ### 4. Configure slackatui
 
@@ -96,7 +109,7 @@ This walks you through all settings including Slack credentials, notifications, 
   "auth": {
     "client_id": "YOUR_CLIENT_ID_HERE",
     "client_secret": "YOUR_CLIENT_SECRET_HERE",
-    "redirect_uri": "https://localhost:8888",
+    "redirect_uri": "https://localhost:8888/callback",
     "token_store": "keychain",
     "token_preference": "user"
   },
@@ -110,7 +123,7 @@ This walks you through all settings including Slack credentials, notifications, 
 |---|---|
 | `auth.client_id` | Your Slack App's Client ID (from step 3) |
 | `auth.client_secret` | Your Slack App's Client Secret (from step 3) |
-| `auth.redirect_uri` | Must match what you set in the Slack App (`https://localhost:8888`) |
+| `auth.redirect_uri` | Must match what you set in the Slack App (`https://localhost:8888/callback`) |
 | `auth.token_store` | `"keychain"` (macOS Keychain) or `"file"` (JSON at `~/.config/slackatui/tokens.json`) |
 | `auth.token_preference` | `"user"` (recommended) or `"bot"` |
 | `auth.team_id` | Optional. Set to target a specific workspace if you have multiple |
@@ -125,6 +138,7 @@ slackatui auth
 ```
 
 This will:
+
 1. Start a local HTTPS server on port 8888 (with a self-signed cert)
 2. Open your browser to `https://localhost:8888`
 3. Your browser will show a certificate warning — click **Advanced** > **Proceed to localhost** (this is normal for the self-signed cert)
@@ -133,7 +147,8 @@ This will:
 6. Your token is saved to Keychain (or file, based on config)
 
 You should see:
-```
+
+```text
 Authentication successful!
 Team: Your Workspace Name
 Tokens stored in: Keychain
@@ -220,7 +235,7 @@ The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Threa
 
 **"auth.client_id is not set"** — Edit your config file and add your Slack App's Client ID. On macOS the path is `~/Library/Application Support/slackatui/config`. On Linux it's `~/.config/slackatui/config`.
 
-**OAuth flow hangs** — Make sure port 8888 is free and your redirect URI matches exactly (`https://localhost:8888`).
+**OAuth flow hangs** — Make sure port 8888 is free and your redirect URI matches exactly (`https://localhost:8888/callback`).
 
 **Browser shows certificate warning** — This is expected. The auth flow uses a self-signed TLS certificate for the local callback server. Click "Advanced" and "Proceed to localhost" to complete the flow.
 
@@ -230,10 +245,10 @@ The UI has three panes: **Channels** (sidebar), **Chat** (messages), and **Threa
 
 ## Architecture
 
-```
+```text
 src/
 ├── main.rs          # Entry point, arg parsing, token loading
-├── config.rs        # JSON config loading and validation
+├── config.rs         # JSON config loading and validation
 ├── types.rs         # Core data types (ChannelItem, Message, Mode)
 ├── parse.rs         # Message parsing (mentions, emoji, HTML)
 ├── service.rs       # High-level Slack service (API -> display types)

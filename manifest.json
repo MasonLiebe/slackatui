@@ -1,0 +1,40 @@
+{
+  "display_information": {
+    "name": "slackatui",
+    "description": "Slack TUI client"
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://localhost:8888/callback"
+    ],
+    "scopes": {
+      "user": [
+        "channels:read",
+        "channels:history",
+        "channels:write",
+        "groups:read",
+        "groups:history",
+        "groups:write",
+        "im:read",
+        "im:history",
+        "im:write",
+        "mpim:read",
+        "mpim:history",
+        "mpim:write",
+        "chat:write",
+        "users:read",
+        "users:write",
+        "reactions:read",
+        "reactions:write",
+        "files:read",
+        "files:write",
+        "users.profile:read",
+        "users.profile:write",
+        "search:read"
+      ]
+    }
+  },
+  "settings": {
+    "token_rotation_enabled": false
+  }
+}
